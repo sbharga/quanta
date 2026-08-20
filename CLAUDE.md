@@ -1,11 +1,11 @@
-# Quanta Agent Notes
+Quanta is a local Flask + LangGraph application that turns a Kaggle dataset into a live, AI-authored analysis notebook: it downloads and inventories a dataset, proposes analysis questions, and streams code, narrative, tables, plots, progress, and errors while a language model iteratively works through the request.
 
 ## Commands
 
 - Use Python 3.14 and `uv`; install with `uv sync --group dev` and run with `uv run quanta`.
 - Run the full checks with `uv run ruff check .`, `uv run mypy src`, and `uv run pytest -q`.
 - Run one test with `uv run pytest tests/test_notebook.py::test_name -vv`; the suite needs neither Kaggle nor an LLM key.
-- The browser serves committed `src/quanta/static/tailwind.css`, not the source stylesheet. After changing CSS or Tailwind classes, rebuild it with `./.tools/tailwindcss -i src/quanta/static/tailwind.src.css -o src/quanta/static/tailwind.css --minify`. The CLI is local and gitignored; README documents how to fetch it if absent.
+- The browser serves committed `src/quanta/static/tailwind.css`, not the source stylesheet. After changing CSS or Tailwind classes, rebuild it with `./.tools/tailwindcss -i src/quanta/static/tailwind.src.css -o src/quanta/static/tailwind.css --minify`. The CLI is local and gitignored; see README for how to fetch it if absent.
 
 ## Runtime Map
 
@@ -26,3 +26,7 @@
 - Runtime Settings values override environment variables and are stored owner-only under the configured data directory. API responses must never return saved secrets.
 - `instance/`, SQLite databases, downloaded datasets, generated artifacts, `.tools/`, and local settings are runtime data and are gitignored; tests should use `tmp_path` rather than the live database.
 - Model-generated Python is intentionally executed with host permissions. Do not describe the worker limits as a security sandbox.
+
+## Ruff Ignores
+
+`BLE001` (blind except) and `S102` (exec use) are disabled project-wide, not per-file — see `pyproject.toml` for the rationale (deliberate top-level failure boundaries in `analysis.py`/`app.py`/`datasets.py`, and `kernel.py`'s `exec()`/`eval()` being the product itself, not incidental).

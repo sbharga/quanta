@@ -440,6 +440,8 @@ async function cancelSession() {
 
 function resizeComposerInput() {
   const input = $("#composer-input");
+  input.style.height = "";
+  if (!input.value) return;
   input.style.height = "auto";
   input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
 }
