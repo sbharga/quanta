@@ -10,7 +10,7 @@ Quanta is a local Flask and LangGraph application that turns a Kaggle dataset in
 - Dataset-specific suggested questions plus a custom request
 - Durable LangGraph checkpoints and complete SQLite session history
 - Live Server-Sent Events with replay after browser reconnects
-- Persistent per-session Python state with stdout, stderr, DataFrames, values, and Matplotlib figures
+- Persistent per-session Python state with stdout, stderr, DataFrames, values, and Matplotlib figures; generated code receives every successful active cell and can reuse its variables
 - Immutable cell revisions, manual editing, reruns, and AI-directed error correction
 - Session restoration after application restarts
 - Session rename and delete from the sidebar
@@ -86,7 +86,7 @@ Open **Packages** (in the session header) to install third-party Python packages
 
 ## Persistence
 
-Session metadata, events, cells, revisions, executions, and LangGraph checkpoints are stored in `instance/quanta.sqlite3`. Downloaded data and generated figures are stored under `instance/sessions/<session-id>/`. Installed packages live under `instance/packages/` and are shared by every session. On restart, the visible notebook and all previous outputs are restored. Before the next execution, successful active cells are replayed to reconstruct Python state.
+Session metadata, events, cells, revisions, executions, and LangGraph checkpoints are stored in `instance/quanta.sqlite3`. Downloaded data and generated figures are stored under `instance/sessions/<session-id>/`. Installed packages live under `instance/packages/` and are shared by every session. On restart, the visible notebook and all previous outputs are restored. Before the next execution, successful active cells are replayed to reconstruct Python state. Code-generation prompts include those same successful cells in execution order, allowing later cells to reuse their variables rather than reload data or repeat work.
 
 ## Security
 

@@ -704,7 +704,7 @@ function applySessionStatus(status, message, running = null) {
   state.session.running = running === null
     ? ["running", "downloading", "inspecting", "cancelling"].includes(status)
     : running;
-  setStatus(status, message);
+  setStatus(status, status === "complete" ? "complete" : message);
   $("#cancel-button").classList.toggle("hidden", !state.session.running || status === "cancelling");
   const row = document.querySelector(`.session-row[data-session-id="${CSS.escape(state.sessionId)}"]`);
   if (row) {
@@ -883,7 +883,7 @@ function applyEvent(type, data) {
       applyTimelineEntry({type: "note", event: "kernel_replay_finished"});
       break;
     case "cells_stale":
-      applyTimelineEntry({type: "note", event: "cells_stale", message: data.message});
+      // Kept as a recognized event so old persisted sessions replay cleanly.
       break;
     case "note":
       clearPendingDraft();

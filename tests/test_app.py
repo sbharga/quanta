@@ -19,6 +19,8 @@ def test_home_and_session_api(tmp_path: Path) -> None:
 
     home = client.get("/")
     assert home.status_code == 200
+    assert 'rel="icon"' in home.get_data(as_text=True)
+    assert 'favicon.svg' in home.get_data(as_text=True)
     assert 'id="data-button"' in home.get_data(as_text=True)
     assert 'id="dataset-explorer"' in home.get_data(as_text=True)
     assert 'id="packages-dialog"' in home.get_data(as_text=True)

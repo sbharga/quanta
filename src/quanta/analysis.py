@@ -65,7 +65,7 @@ class AnalystDecision(BaseModel):
             "notebook cell is already Markdown or no new result needs explanation."
         ),
     )
-    target_cell_id: str | None = Field(default=None, description="Existing cell ID for edit or rerun")
+    target_cell_id: str | None = Field(default=None, description="Existing code cell ID for edit or rerun")
     packages: list[str] = Field(
         default_factory=list,
         description="Package requirements to install (e.g. 'seaborn', 'scikit-learn==1.5.0'), only when action is install",
@@ -257,10 +257,17 @@ class AnalysisEngine:
         )
         assert isinstance(decision, AnalystDecision)  # guaranteed by with_structured_output's schema
         payload = decision.model_dump()
+        markdown = _markdown_instruction(payload["instruction"]) if payload["action"] == "create" else None
+        if markdown:
+            payload["action"] = "finish"
+            payload["instruction"] = "The requested analysis is complete."
+            payload["narration"] = markdown
         self.events.emit(session_id, "agent_decision", **payload)
         narration = payload["narration"].strip()
         latest_cell = cells[-1] if cells else None
-        if narration and latest_cell and latest_cell["kind"] == "code" and latest_cell["executions"]:
+        if narration and (
+            markdown or (latest_cell and latest_cell["kind"] == "code" and latest_cell["executions"])
+        ):
             self.notebook.create_cell(session_id, "markdown", narration)
         return {"decision": payload, "iterations": state.get("iterations", 0) + 1}
 
@@ -286,6 +293,14 @@ class AnalysisEngine:
                 target = self.store.get_cell(decision["target_cell_id"])
             except KeyError:
                 target = None
+            if target and (target["session_id"] != session_id or target["kind"] != "code"):
+                self.events.emit(
+                    session_id,
+                    "note",
+                    message="The requested edit target was not a code cell; creating a new code cell instead.",
+                )
+                target = None
+        successful_cells = _successful_code_context(self.store.list_cells(session_id))
         columns = column_brief(state["manifest"])
         prompt = _code_generation_prompt(
             instruction=decision["instruction"],
@@ -294,6 +309,7 @@ class AnalysisEngine:
             target=target,
             recent_result=state.get("recent_result", {}),
             installed=_installed_packages_brief(self.packages),
+            successful_cells=successful_cells,
         )
         source = self._stream_model(
             session_id,
@@ -344,6 +360,19 @@ class AnalysisEngine:
                 "recent_result": {
                     "status": "error",
                     "outputs": [{"type": "error", "message": "No target cell was selected"}],
+                }
+            }
+        try:
+            target = self.store.get_cell(cell_id)
+        except KeyError:
+            target = None
+        if not target or target["session_id"] != session_id or target["kind"] != "code":
+            message = "Only code cells in this session can be executed. Choose a code cell or create a new one."
+            self.events.emit(session_id, "note", message=message)
+            return {
+                "recent_result": {
+                    "status": "error",
+                    "outputs": [{"type": "error", "message": message}],
                 }
             }
         self.notebook.restore_kernel(session_id)
@@ -727,6 +756,35 @@ def _installed_packages_brief(packages: PackageManager) -> str:
     return ", ".join(names)
 
 
+def _successful_code_context(cells: list[dict[str, Any]]) -> str:
+    """Render active code revisions whose latest execution succeeded, in execution order."""
+    successful: list[tuple[int, dict[str, Any]]] = []
+    for cell in cells:
+        if cell["kind"] != "code":
+            continue
+        active_executions = [
+            execution
+            for execution in cell["executions"]
+            if execution["revision_id"] == cell["active_revision_id"]
+        ]
+        if active_executions and active_executions[-1]["status"] == "ok":
+            successful.append((active_executions[-1]["execution_count"], cell))
+    successful.sort(key=lambda item: item[0])
+    return "\n\n".join(
+        f"Successful cell {cell['id']} (revision {cell['revision']}):\n{cell['source']}"
+        for _execution_count, cell in successful
+    )
+
+
+def _markdown_instruction(instruction: str) -> str | None:
+    """Extract a Markdown document mistakenly requested through the code-only create action."""
+    stripped = instruction.strip()
+    if stripped.lower().startswith("markdown\n"):
+        return stripped.split("\n", 1)[1].strip() or None
+    match = re.fullmatch(r"```(?:markdown|md)\s*\n(.*?)```", stripped, re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match and match.group(1).strip() else None
+
+
 def _code_generation_prompt(
     *,
     instruction: str,
@@ -735,6 +793,7 @@ def _code_generation_prompt(
     target: dict[str, Any] | None,
     recent_result: dict[str, Any],
     installed: str = "(none)",
+    successful_cells: str = "",
 ) -> str:
     prompt = (
         "Write one executable Python notebook cell for the requested data-analysis step. "
@@ -745,6 +804,13 @@ def _code_generation_prompt(
     )
     if columns:
         prompt += f"\n{columns}\n"
+    if successful_cells:
+        prompt += (
+            "\nPreviously successful cells, in execution order:\n"
+            "These cells already ran in this persistent kernel. Every variable, import, function, and model they "
+            "defined remains available. Reuse that state instead of reloading data or repeating completed work.\n\n"
+            f"{successful_cells}\n"
+        )
     if target:
         prompt += (
             f"\nExisting failing cell to replace:\n{target['source']}\n"
@@ -775,6 +841,8 @@ def _strip_code_fence(source: str) -> str:
 
 _ANALYST_SYSTEM = """You control an iterative data-analysis notebook. Choose exactly one next action.
 Use create to add and run a new code cell. Use edit when an earlier failed or flawed cell must be corrected, and provide its exact cell ID. Use rerun to execute an existing correct cell again. Use ask only when essential ambiguity prevents progress. Use install when a cell needs a third-party package that is not already installed — list the exact requirement(s) (e.g. "seaborn", "scikit-learn==1.5.0") in packages, and prefer the standard library, pandas, NumPy, or Matplotlib whenever they already cover the need. Use finish once the user's request has been answered.
+The target_cell_id for edit or rerun must be the ID of a code cell, never a Markdown narration cell. If the missing work belongs in a new step rather than replacing existing code, choose create instead of edit.
+The create and edit actions are exclusively for executable Python that performs computation. Never use them for prose, Markdown, a summary, an interpretation, or a conclusion, and never instruct a code cell to print narrative text. Put all user-facing prose in narration. When the analysis is complete, put the polished final answer itself in narration and choose finish; do not write a short meta-description saying that you summarized it.
 When the latest notebook cell is executed code with useful output that has not yet been explained, put one concise, evidence-backed Markdown interpretation in narration while choosing the next action. Leave narration empty when the latest cell is already Markdown, when there is no new result, or when the result needs correction rather than explanation. Never repeat an interpretation.
 Inspect outputs before drawing conclusions. Recover from errors by editing the responsible cell. Prefer small, readable cells, bounded displays, and evidence-backed analysis. Never invent results. Do not access files outside DATASET_DIR.
 Before choosing create, check the notebook so far: never regenerate a cell whose output already answers the same question. If useful analysis already ran and was explained in a text cell, treat that as done and move the request forward instead of repeating it.
@@ -784,8 +852,10 @@ Column names may contain leading/trailing whitespace or unusual characters — t
 
 _CODE_SYSTEM = """You write single, executable Python cells for a persistent notebook kernel.
 DATASET_DIR (pathlib.Path), pd, np, and plt are already imported and available; do not re-import or redefine them. Read dataset files only through DATASET_DIR; never use Kaggle notebook paths such as /kaggle/input.
+The prompt includes every active code cell whose latest execution succeeded. Those cells already ran in this kernel, so all variables, imports, functions, and models they defined remain available. Reuse them instead of reloading data or repeating completed computation.
 You may import the standard library, pandas, NumPy, and Matplotlib, plus any package explicitly listed as installed below — nothing else. If a cell genuinely needs a package that isn't listed, do not import it; the calling agent installs packages via a separate action before code is generated.
 This is a plain Python exec kernel, not Jupyter or IPython: do not use display(), IPython imports, or notebook magics. End with a value expression or use print() for text output.
+Code cells are for computation and computed outputs, not prose presentation. Never convert a requested Markdown summary, interpretation, or conclusion into print(...); user-facing narrative belongs in a Markdown cell created by the analyst.
 The kernel worker is a daemonic process and cannot create child processes. Use num_workers=0 and n_jobs=1, and disable multiprocessing/joblib parallelism in any similar API.
 Column names are given to you verbatim via repr() — including any leading/trailing whitespace — and must be indexed exactly as shown, never guessed or stripped unless the task explicitly asks you to clean them.
 When a chart is appropriate: create exactly one figure with plt.figure(figsize=(9, 5)) or an equivalent axes call, always set a title and axis labels, and do not call plt.show() — every open figure is captured and displayed automatically after the cell runs. In Matplotlib boxplot(), use tick_labels= rather than the removed labels= argument.
