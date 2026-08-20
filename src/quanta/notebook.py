@@ -29,12 +29,6 @@ class NotebookService:
             raise KeyError(cell_id)
         revised = self.store.revise_cell(cell_id, source, author)
         self.events.emit(session_id, "cell_revised", cell=_public_cell(revised))
-        self.events.emit(
-            session_id,
-            "cells_stale",
-            after_position=revised["position"],
-            message="Later cells may depend on this revision.",
-        )
         return revised
 
     def run_cell(self, session_id: str, cell_id: str) -> dict[str, Any]:
@@ -333,7 +327,6 @@ _NOTE_EVENT_TYPES = {
     "kernel_replay_started",
     "kernel_replay_progress",
     "kernel_replay_finished",
-    "cells_stale",
     "note",
     "package_install_started",
     "package_install_finished",

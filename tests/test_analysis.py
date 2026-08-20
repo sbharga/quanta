@@ -121,6 +121,43 @@ def test_code_prompt_puts_failure_before_required_fix() -> None:
     assert prompt.endswith("Replace seaborn with matplotlib\n")
 
 
+def test_generate_code_receives_every_successful_active_cell(tmp_path: Path, monkeypatch) -> None:
+    engine, store = make_engine(tmp_path)
+    session = store.create_session("owner/dataset")
+    first = store.create_cell(session["id"], "code", "df = pd.read_csv(DATASET_DIR / 'data.csv')")
+    first_execution = store.start_execution(session["id"], first)
+    store.finish_execution(first_execution["id"], "ok", [])
+    second = store.create_cell(session["id"], "code", "summary = df.groupby('group').value.mean()")
+    second_execution = store.start_execution(session["id"], second)
+    store.finish_execution(second_execution["id"], "ok", [])
+    failed = store.create_cell(session["id"], "code", "broken = missing_name")
+    failed_execution = store.start_execution(session["id"], failed)
+    store.finish_execution(failed_execution["id"], "error", [{"type": "error", "message": "NameError"}])
+    monkeypatch.setattr(engine, "notebook", _FakeNotebook(store))
+    prompts = []
+
+    def capture_prompt(_session_id, _kind, prompt, **_kwargs):
+        prompts.append(prompt)
+        return "summary"
+
+    monkeypatch.setattr(engine, "_stream_model", capture_prompt)
+
+    engine._generate_code(  # type: ignore[arg-type]
+        {
+            "session_id": session["id"],
+            "manifest": {"files": []},
+            "decision": {"action": "create", "instruction": "Show the summary"},
+        }
+    )
+
+    prompt = prompts[0]
+    assert first["source"] in prompt
+    assert second["source"] in prompt
+    assert prompt.index(first["source"]) < prompt.index(second["source"])
+    assert failed["source"] not in prompt
+    assert "Every variable, import, function, and model they defined remains available" in prompt
+
+
 def test_unchanged_failing_edit_is_not_saved_or_executed(tmp_path: Path, monkeypatch) -> None:
     engine, store = make_engine(tmp_path)
     session = store.create_session("owner/dataset")
@@ -147,6 +184,49 @@ def test_unchanged_failing_edit_is_not_saved_or_executed(tmp_path: Path, monkeyp
     with pytest.raises(RuntimeError, match="same failing code twice"):
         engine._generate_code({**state, "unchanged_generations": 1})  # type: ignore[arg-type]
     assert store.get_cell(cell["id"])["revision"] == 1
+
+
+def test_edit_targeting_markdown_creates_code_instead(tmp_path: Path, monkeypatch) -> None:
+    engine, store = make_engine(tmp_path)
+    session = store.create_session("owner/dataset")
+    markdown = store.create_cell(session["id"], "markdown", "Explained the previous result.")
+    monkeypatch.setattr(engine, "notebook", _FakeNotebook(store))
+    monkeypatch.setattr(engine, "_stream_model", lambda *_args, **_kwargs: "value = 42")
+
+    result = engine._generate_code(  # type: ignore[arg-type]
+        {
+            "session_id": session["id"],
+            "manifest": {"files": []},
+            "decision": {
+                "action": "edit",
+                "instruction": "Define the missing value",
+                "target_cell_id": markdown["id"],
+            },
+        }
+    )
+
+    assert store.get_cell(markdown["id"])["source"] == "Explained the previous result."
+    created = store.get_cell(result["decision"]["target_cell_id"])
+    assert created["kind"] == "code"
+    assert created["source"] == "value = 42"
+
+
+def test_execute_rejects_markdown_target_without_terminating_run(tmp_path: Path, monkeypatch) -> None:
+    engine, store = make_engine(tmp_path)
+    session = store.create_session("owner/dataset")
+    markdown = store.create_cell(session["id"], "markdown", "A summary")
+    monkeypatch.setattr(engine, "notebook", _FakeNotebook(store))
+
+    result = engine._execute(  # type: ignore[arg-type]
+        {
+            "session_id": session["id"],
+            "decision": {"action": "rerun", "target_cell_id": markdown["id"]},
+        }
+    )
+
+    assert result["recent_result"]["status"] == "error"
+    assert "Only code cells" in result["recent_result"]["outputs"][0]["message"]
+    assert [event["type"] for event in store.events_after(session["id"], 0)] == ["note"]
 
 
 def test_route_decision_maps_install_action(tmp_path: Path) -> None:
@@ -206,6 +286,32 @@ def test_decision_writes_at_most_one_narration_for_an_execution(
 
     markdown = [cell for cell in store.list_cells(session["id"]) if cell["kind"] == "markdown"]
     assert [cell["source"] for cell in markdown] == ["The result is **2**."]
+
+
+def test_decision_turns_markdown_create_into_narration_and_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, store = make_engine(tmp_path)
+    session = store.create_session("owner/dataset")
+    code = store.create_cell(session["id"], "code", "result = 42")
+    execution = store.start_execution(session["id"], code)
+    store.finish_execution(execution["id"], "ok", [{"type": "result", "text": "42"}])
+    monkeypatch.setattr(engine, "notebook", _FakeNotebook(store))
+    decision = AnalystDecision(
+        action="create",
+        rationale="Provide the final summary.",
+        instruction="markdown\n# Summary\n\nThe result is **42**.",
+        narration="Summarized the result.",
+    )
+    monkeypatch.setattr(engine, "_model", lambda: _FakeDecisionModel(decision))
+
+    result = engine._decide(  # type: ignore[arg-type]
+        {"session_id": session["id"], "summary": "A test", "user_request": "Summarize it"}
+    )
+
+    assert result["decision"]["action"] == "finish"
+    markdown = [cell for cell in store.list_cells(session["id"]) if cell["kind"] == "markdown"]
+    assert [cell["source"] for cell in markdown] == ["# Summary\n\nThe result is **42**."]
 
 
 def test_installed_packages_brief_does_not_hide_names_after_forty(tmp_path: Path, monkeypatch) -> None:

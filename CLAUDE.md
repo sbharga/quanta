@@ -13,6 +13,7 @@ Quanta is a local Flask + LangGraph application that turns a Kaggle dataset into
 - `analysis.py` owns the LangGraph workflow, model pacing/retries, interrupt/resume behavior, and background run lifecycle. LangGraph checkpoints share the application SQLite file and use the session ID as `thread_id`.
 - `db.py` is the durable source of truth. `notebook.py` projects its append-only cells, revisions, executions, and events into the restored timeline and `.ipynb` export.
 - `kernel.py` runs one persistent spawned Python worker per session. Worker state survives cells and is reconstructed by replaying successful active revisions after process loss.
+- Code-generation prompts include every successful active code revision in execution order. Keep this selection aligned with kernel replay so generated cells can safely reuse existing variables after process loss.
 - `packages.py` installs/uninstalls third-party packages via `uv pip install --target <packages_dir>` into a shared directory the kernel worker appends to `sys.path`, outside the app's own `uv`-managed `.venv`.
 - The frontend is one vanilla-JS controller in `static/app.js` over `templates/index.html`; there is no npm package or frontend framework.
 
