@@ -1,0 +1,61 @@
+[project]
+name = "quanta"
+version = "0.1.0"
+description = "A live AI-powered data analysis notebook built with Flask and LangGraph"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "flask>=3.1.2",
+    "ijson>=3.4.0",
+    "kaggle>=2.2.4",
+    "langchain-openai>=1.6.0",
+    "langgraph>=1.0.0",
+    "langgraph-checkpoint-sqlite>=3.0.0",
+    "matplotlib>=3.10.0",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.0",
+    "pyarrow>=21.0.0",
+    "pydantic>=2.11.0",
+    "xlrd>=2.0.2",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=8.4.0",
+    "ruff>=0.16.3",
+]
+
+[project.scripts]
+quanta = "quanta:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+# Matches this codebase's existing style (comfortably up to ~120 chars
+# already, including some intentionally long single-line prompt strings in
+# analysis.py) rather than ruff's default 88, which would force a disruptive
+# reflow of lines that were already fine.
+line-length = 120
+
+[tool.ruff.lint]
+# BLE001 (blind except): disabled project-wide. Every blind except in this
+# codebase is a deliberate top-level boundary — a background-thread
+# supervisor (analysis.py, app.py) that must surface any failure rather than
+# die silently, or the dataset inspector isolating one bad file from failing
+# a whole mixed-format scan (datasets.py) — plus the notebook kernel, which
+# must catch BaseException so arbitrary user-submitted code becomes a cell
+# error instead of crashing the worker (kernel.py).
+# S102 (exec use): disabled project-wide. kernel.py's exec()/eval() calls are
+# the actual mechanism by which this app executes notebook cells — it's not
+# incidental, it's the product.
+ignore = ["BLE001", "S102"]
+
+[tool.mypy]
+python_version = "3.14"
+ignore_missing_imports = true
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

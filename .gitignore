@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local configuration and generated application data
+.env
+instance/
+*.db
+*.sqlite
+*.sqlite3
+
+# Test and tool caches
+.pytest_cache/
+.coverage
+
+# Vendored standalone Tailwind CLI binary (downloaded, not committed)
+.tools/

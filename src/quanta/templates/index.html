@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quanta</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='tailwind.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body class="h-screen overflow-hidden bg-bg text-fg font-mono text-[13px] antialiased">
+  <div class="flex h-full">
+    <aside id="sidebar" class="flex flex-col w-64 shrink-0 border-r border-line bg-panel">
+      <div id="sidebar-header" class="p-2 border-b border-line flex items-center gap-1">
+        <button id="new-session" type="button" class="flex-1 flex items-center gap-2 px-2 py-1.5 rounded hover:bg-panel-raised text-left min-w-0">
+          <span class="text-accent shrink-0">+</span><span class="sidebar-label truncate">New analysis</span>
+        </button>
+      </div>
+      <div id="session-list" class="flex-1 overflow-y-auto p-1 space-y-0.5"></div>
+      <div class="border-t border-line p-2 flex items-center gap-2">
+        <span id="key-warning" class="hidden w-1.5 h-1.5 rounded-full bg-err shrink-0" title="Model API key missing"></span>
+        <span id="sidebar-model" class="sidebar-label flex-1 min-w-0 truncate text-[11px] text-dim">{{ model }}</span>
+        <button id="settings-button" type="button" class="p-1.5 rounded hover:bg-panel-raised text-dim shrink-0" title="Settings">&#9881;</button>
+      </div>
+    </aside>
+
+    <main id="main" class="flex-1 flex flex-col min-w-0">
+      <header id="session-header" class="hidden flex items-center justify-between gap-3 px-4 py-2 border-b border-line shrink-0">
+        <div class="min-w-0">
+          <div id="header-title" class="truncate text-[13px]"></div>
+          <div id="header-dataset" class="truncate text-[10px] text-dim"></div>
+        </div>
+        <div class="flex items-center gap-3 shrink-0">
+          <span class="flex items-center gap-1.5 text-[11px] text-dim">
+            <span id="status-dot" class="w-2 h-2 rounded-full bg-faint"></span>
+            <span id="status-text">Starting</span>
+          </span>
+          <a id="download-button" class="text-[11px] px-2 py-1 border border-line rounded hover:bg-panel-raised text-dim" title="Download as .ipynb">.ipynb</a>
+          <button id="cancel-button" type="button" class="hidden text-[11px] px-2 py-1 border border-line rounded hover:bg-panel-raised text-err">Stop</button>
+        </div>
+      </header>
+
+      <div id="empty-state" class="flex-1 flex items-center justify-center px-4">
+        <form id="dataset-form" class="w-full max-w-md">
+          <input id="dataset-input" name="dataset" autocomplete="off" required
+            class="w-full bg-panel border border-line rounded px-3 py-2.5 text-[13px] focus:outline-none focus:border-accent placeholder:text-faint"
+            placeholder="owner/dataset or kaggle.com/datasets/... URL">
+          <p class="mt-2 text-[11px] text-faint">Kaggle credentials come from Settings or ~/.kaggle.</p>
+        </form>
+      </div>
+
+      <div id="timeline-host" class="hidden flex-1 overflow-y-auto relative">
+        <div id="timeline" class="max-w-3xl mx-auto px-4 py-4 flex flex-col gap-2"></div>
+        <button id="jump-latest" type="button" class="hidden absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-full border border-line bg-panel-raised text-[11px] text-dim shadow-lg hover:text-fg">
+          &darr; jump to latest
+        </button>
+      </div>
+
+      <div id="composer" class="hidden border-t border-line px-4 py-3 shrink-0">
+        <div class="max-w-3xl mx-auto">
+          <div id="prompt-text" class="hidden mb-2 text-[11.5px] text-dim whitespace-pre-wrap"></div>
+          <div id="suggestions" class="hidden flex flex-wrap gap-2 mb-2"></div>
+          <form id="composer-form" class="flex gap-2 items-end">
+            <textarea id="composer-input" rows="1"
+              class="flex-1 resize-none bg-panel border border-line rounded px-3 py-2 text-[13px] focus:outline-none focus:border-accent placeholder:text-faint"
+              placeholder="Ask a follow-up or request a different approach..."></textarea>
+            <button type="submit" class="px-3 py-2 border border-line rounded text-[12px] hover:bg-panel-raised shrink-0">Send</button>
+          </form>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="settings-dialog" class="m-auto w-[min(560px,calc(100vw-2rem))] bg-panel border border-line rounded-lg p-0 text-fg backdrop:bg-black/60">
+    <form id="settings-form" class="p-6">
+      <div class="flex items-start justify-between mb-1">
+        <h2 class="text-[15px] font-semibold m-0">Settings</h2>
+        <button id="settings-close" type="button" class="text-dim hover:text-fg text-lg leading-none" aria-label="Close settings">&times;</button>
+      </div>
+      <p class="text-[11px] text-dim leading-relaxed mb-4">Credentials are saved on this machine with owner-only file permissions. Existing values are never sent back to the browser.</p>
+
+      <div class="border border-line rounded-lg p-4 mt-3 bg-panel-raised">
+        <div class="flex items-center justify-between mb-3">
+          <strong class="text-[12px]">Language model</strong>
+          <span id="llm-status" class="text-[10px] px-2 py-0.5 rounded-full bg-line text-dim"></span>
+        </div>
+        <label for="llm-key" class="block text-[11px] font-semibold mb-1.5">API key</label>
+        <input id="llm-key" type="password" autocomplete="new-password" placeholder="Leave blank to keep the current key"
+          class="w-full bg-bg border border-line rounded px-2.5 py-1.5 text-[12px] focus:outline-none focus:border-accent">
+        <label class="flex items-center gap-1.5 mt-2 text-[11px] text-dim">
+          <input id="clear-llm" type="checkbox" class="accent-accent"> Remove saved key override
+        </label>
+        <label for="llm-model" class="block text-[11px] font-semibold mt-3 mb-1.5">Model</label>
+        <input id="llm-model" type="text" placeholder="openai/gpt-4o-mini"
+          class="w-full bg-bg border border-line rounded px-2.5 py-1.5 text-[12px] focus:outline-none focus:border-accent">
+        <label for="llm-base-url" class="block text-[11px] font-semibold mt-3 mb-1.5">Base URL</label>
+        <input id="llm-base-url" type="text" placeholder="https://openrouter.ai/api/v1"
+          class="w-full bg-bg border border-line rounded px-2.5 py-1.5 text-[12px] focus:outline-none focus:border-accent">
+        <p class="mt-2 text-[10px] text-faint leading-relaxed">Any OpenAI-compatible endpoint works — OpenRouter (default), OpenAI, a local Ollama/LM Studio/vLLM server, Groq, Together, and so on.</p>
+      </div>
+
+      <div class="border border-line rounded-lg p-4 mt-3 bg-panel-raised">
+        <div class="flex items-center justify-between mb-3">
+          <strong class="text-[12px]">Kaggle</strong>
+          <span id="kaggle-status" class="text-[10px] px-2 py-0.5 rounded-full bg-line text-dim"></span>
+        </div>
+        <label for="kaggle-token" class="block text-[11px] font-semibold mb-1.5">API token</label>
+        <input id="kaggle-token" type="password" autocomplete="new-password" placeholder="Leave blank to keep the current token"
+          class="w-full bg-bg border border-line rounded px-2.5 py-1.5 text-[12px] focus:outline-none focus:border-accent">
+        <label class="flex items-center gap-1.5 mt-2 text-[11px] text-dim">
+          <input id="clear-kaggle" type="checkbox" class="accent-accent"> Remove saved token override
+        </label>
+      </div>
+
+      <div class="flex items-center justify-between gap-4 mt-5">
+        <span id="settings-message" class="text-[11px] text-accent"></span>
+        <button type="submit" class="px-3 py-1.5 border border-line rounded text-[12px] hover:bg-panel-raised">Save settings</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="hidden fixed right-5 bottom-5 z-30 max-w-sm px-4 py-3 rounded-lg text-[12px] bg-err-dim text-fg border border-err/40 shadow-lg" role="alert"></div>
+</body>
+</html>
