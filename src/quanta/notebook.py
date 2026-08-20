@@ -335,4 +335,11 @@ _NOTE_EVENT_TYPES = {
     "kernel_replay_finished",
     "cells_stale",
     "note",
+    "package_install_started",
+    "package_install_finished",
 }
+# package_install_output is deliberately excluded: it streams one event per
+# line of uv's output (potentially dozens per install) and is only ever
+# rendered as a transient status-line update in the UI, not a timeline entry
+# (see applyEvent in app.js) — folding it here would make a session refresh
+# mid-install show a flood of notes that never appeared during the live run.

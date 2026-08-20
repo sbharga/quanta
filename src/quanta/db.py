@@ -92,6 +92,14 @@ class Store:
                     ON events(session_id, seq);
                 CREATE INDEX IF NOT EXISTS idx_cells_session_position
                     ON cells(session_id, position);
+                CREATE TABLE IF NOT EXISTS packages (
+                    name TEXT PRIMARY KEY,
+                    requirement TEXT NOT NULL,
+                    version TEXT,
+                    author TEXT NOT NULL,
+                    session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+                    installed_at TEXT NOT NULL
+                );
                 """
             )
             # No migration framework exists yet, so patch older databases
@@ -340,6 +348,33 @@ class Store:
         if row is None:
             return None
         return {**dict(row), "payload": _loads(row["payload_json"])}
+
+    def record_package(
+        self, name: str, requirement: str, version: str | None, author: str, session_id: str | None
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO packages(name, requirement, version, author, session_id, installed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    requirement = excluded.requirement,
+                    version = excluded.version,
+                    author = excluded.author,
+                    session_id = excluded.session_id,
+                    installed_at = excluded.installed_at
+                """,
+                (name, requirement, version, author, session_id, utc_now()),
+            )
+
+    def forget_package(self, name: str) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM packages WHERE name = ?", (name,))
+
+    def list_packages(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM packages ORDER BY name").fetchall()
+        return [dict(row) for row in rows]
 
 
 def _loads(value: str | None) -> Any:

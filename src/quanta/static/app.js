@@ -6,6 +6,8 @@ const state = {
   draftBuffers: {},
   pendingDraftId: null,
   pendingPrompt: null,
+  selectedDatasetPath: null,
+  packages: [],
   pinned: true,
   submitting: false,
   toastTimer: null,
@@ -27,11 +29,30 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#composer-input").addEventListener("keydown", composerKeydown);
   $("#new-session").addEventListener("click", () => closeSession());
   $("#cancel-button").addEventListener("click", cancelSession);
+  $("#data-button").addEventListener("click", openDatasetExplorer);
+  $("#dataset-explorer-close").addEventListener("click", closeDatasetExplorer);
+  $("#dataset-explorer").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeDatasetExplorer();
+  });
+  $("#dataset-explorer").addEventListener("close", () => {
+    $("#data-button").setAttribute("aria-expanded", "false");
+  });
+  $("#dataset-file-filter").addEventListener("input", renderDatasetFiles);
+  $("#lightbox-close").addEventListener("click", closeLightbox);
+  $("#image-lightbox").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeLightbox();
+  });
   $("#jump-latest").addEventListener("click", () => scrollToBottom(true));
   $("#timeline-host").addEventListener("scroll", handleTimelineScroll);
   $("#settings-button").addEventListener("click", openSettings);
   $("#settings-close").addEventListener("click", () => $("#settings-dialog").close());
   $("#settings-form").addEventListener("submit", saveSettings);
+  $("#packages-button").addEventListener("click", openPackages);
+  $("#packages-close").addEventListener("click", closePackages);
+  $("#packages-dialog").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closePackages();
+  });
+  $("#packages-form").addEventListener("submit", installPackages);
   $("#clear-llm").addEventListener("change", syncClearControls);
   $("#clear-kaggle").addEventListener("change", syncClearControls);
   document.addEventListener("click", closeAllMenus);
@@ -76,6 +97,19 @@ function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
   }[c]));
+}
+
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = bytes;
+  let unit = -1;
+  do {
+    amount /= 1024;
+    unit += 1;
+  } while (amount >= 1024 && unit < units.length - 1);
+  return `${amount >= 10 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -154,6 +188,84 @@ async function saveSettings(event) {
     toast(error.message);
   } finally {
     button.disabled = false;
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Packages                                                                */
+/* ---------------------------------------------------------------------- */
+
+async function loadPackages() {
+  try {
+    const data = await api("/api/packages");
+    state.packages = data.packages || [];
+    $("#packages-unavailable").classList.toggle("hidden", data.backend_available);
+    renderPackages();
+    return data;
+  } catch (error) {
+    toast(error.message);
+    return null;
+  }
+}
+
+function renderPackages() {
+  const list = $("#packages-list");
+  list.replaceChildren();
+  if (!state.packages.length) {
+    list.appendChild(el("div", "px-3 py-2 text-[11px] text-faint", "No packages installed yet."));
+    return;
+  }
+  state.packages.forEach((pkg) => {
+    const row = el("div", "flex items-center justify-between gap-2 px-3 py-1.5");
+    const label = el("div", "min-w-0 truncate text-[12px]", pkg.version ? `${pkg.name} ${pkg.version}` : pkg.name);
+    const remove = el("button", "text-dim hover:text-err text-[11px] shrink-0", "Remove");
+    remove.type = "button";
+    remove.addEventListener("click", () => removePackage(pkg.name));
+    row.append(label, remove);
+    list.appendChild(row);
+  });
+}
+
+async function openPackages() {
+  $("#packages-message").textContent = "";
+  $("#packages-input").value = "";
+  await loadPackages();
+  $("#packages-dialog").showModal();
+  $("#packages-button").setAttribute("aria-expanded", "true");
+}
+
+function closePackages() {
+  $("#packages-dialog").close();
+  $("#packages-button").setAttribute("aria-expanded", "false");
+}
+
+async function installPackages(event) {
+  event.preventDefault();
+  if (!state.sessionId) return;
+  const raw = $("#packages-input").value.trim();
+  if (!raw) return;
+  const specs = raw.split(/[\s,]+/).filter(Boolean);
+  const button = event.currentTarget.querySelector("button[type='submit']");
+  button.disabled = true;
+  $("#packages-message").textContent = "";
+  try {
+    await api(`/api/sessions/${state.sessionId}/packages`, {method: "POST", body: JSON.stringify({specs})});
+    $("#packages-input").value = "";
+    $("#packages-message").textContent = "Installing — see the timeline for progress.";
+  } catch (error) {
+    $("#packages-message").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function removePackage(name) {
+  if (!state.sessionId) return;
+  try {
+    await api(`/api/sessions/${state.sessionId}/packages/${encodeURIComponent(name)}`, {method: "DELETE"});
+    $("#packages-message").textContent = "Removing — see the timeline for progress.";
+  } catch (error) {
+    $("#packages-message").textContent = error.message;
   }
 }
 
@@ -326,14 +438,17 @@ async function createSession(event) {
 
 async function openSession(sessionId) {
   if (state.source) state.source.close();
+  closeDatasetExplorer();
   state.sessionId = sessionId;
   state.session = null;
   state.cellNodes = {};
   state.draftBuffers = {};
   state.pendingDraftId = null;
   state.pendingPrompt = null;
+  state.selectedDatasetPath = null;
   state.submitting = false;
   state.pinned = true;
+  $("#dataset-file-filter").value = "";
   $("#composer-input").value = "";
   resizeComposerInput();
   localStorage.setItem("quanta-session", sessionId);
@@ -349,6 +464,7 @@ async function openSession(sessionId) {
     state.session = session;
     $("#session-header").classList.remove("hidden");
     renderSessionHeader(session);
+    renderDatasetExplorer(session.manifest);
     renderTimelineSeed(session.timeline || []);
     if (session.active_draft) {
       startDraft(session.active_draft);
@@ -384,14 +500,190 @@ function closeSession() {
   state.draftBuffers = {};
   state.pendingDraftId = null;
   state.pendingPrompt = null;
+  state.selectedDatasetPath = null;
   state.submitting = false;
   localStorage.removeItem("quanta-session");
   $("#timeline").replaceChildren();
   $("#timeline-host").classList.add("hidden");
   $("#composer").classList.add("hidden");
   $("#session-header").classList.add("hidden");
+  $("#data-button").classList.add("hidden");
+  closeDatasetExplorer();
   $("#empty-state").classList.remove("hidden");
   highlightSidebarActive();
+}
+
+/* ---------------------------------------------------------------------- */
+/* Dataset explorer                                                       */
+/* ---------------------------------------------------------------------- */
+
+function renderDatasetExplorer(manifest) {
+  if (state.session) state.session.manifest = manifest || null;
+  const available = Boolean(manifest?.files?.length);
+  $("#data-button").classList.toggle("hidden", !available);
+  if (!available) {
+    closeDatasetExplorer();
+    return;
+  }
+  const errors = manifest.errors?.length || 0;
+  $("#dataset-explorer-stats").textContent = `${manifest.file_count} file${manifest.file_count === 1 ? "" : "s"} · ${formatBytes(manifest.total_bytes)}${errors ? ` · ${errors} warning${errors === 1 ? "" : "s"}` : ""}`;
+  renderDatasetFiles();
+}
+
+function openDatasetExplorer() {
+  if (!state.session?.manifest?.files?.length) return;
+  const dialog = $("#dataset-explorer");
+  if (!dialog.open) dialog.showModal();
+  $("#data-button").setAttribute("aria-expanded", "true");
+  renderDatasetFiles();
+  $("#dataset-file-filter").focus();
+}
+
+function closeDatasetExplorer() {
+  $("#dataset-explorer").close();
+}
+
+function openLightbox(src, alt) {
+  const dialog = $("#image-lightbox");
+  $("#lightbox-image").src = src;
+  $("#lightbox-image").alt = alt || "Enlarged plot";
+  $("#lightbox-caption").textContent = alt || "";
+  if (!dialog.open) dialog.showModal();
+}
+
+function closeLightbox() {
+  const dialog = $("#image-lightbox");
+  if (dialog.open) dialog.close();
+  $("#lightbox-image").src = "";
+}
+
+function renderDatasetFiles() {
+  const manifest = state.session?.manifest;
+  if (!manifest?.files) return;
+  const query = $("#dataset-file-filter").value.trim().toLowerCase();
+  const files = manifest.files.filter((file) => file.path.toLowerCase().includes(query));
+  const list = $("#dataset-file-list");
+  list.replaceChildren();
+
+  if (!files.length) {
+    list.appendChild(el("div", "px-2 py-3 text-[11px] text-faint", "No matching files"));
+    $("#dataset-file-detail").replaceChildren();
+    return;
+  }
+  if (!files.some((file) => file.path === state.selectedDatasetPath)) {
+    state.selectedDatasetPath = files[0].path;
+  }
+  files.forEach((file) => {
+    const parts = file.path.split("/");
+    const name = parts.pop();
+    const directory = parts.join("/");
+    const selected = file.path === state.selectedDatasetPath;
+    const button = el("button", `w-full text-left rounded px-2 py-2 border ${selected ? "border-accent/50 bg-panel-raised" : "border-transparent hover:bg-panel-raised"}`);
+    button.type = "button";
+    button.title = file.path;
+    button.setAttribute("aria-pressed", String(selected));
+    const top = el("div", "flex items-start justify-between gap-2");
+    top.append(el("span", "truncate text-[11.5px]", name), el("span", `text-[9.5px] shrink-0 ${file.error ? "text-err" : "text-faint"}`, file.error ? "error" : (file.inspection?.kind || file.type)));
+    button.appendChild(top);
+    if (directory) button.appendChild(el("div", "truncate mt-0.5 text-[9.5px] text-faint", directory));
+    button.addEventListener("click", () => {
+      state.selectedDatasetPath = file.path;
+      renderDatasetFiles();
+    });
+    list.appendChild(button);
+  });
+  renderDatasetFileDetail(files.find((file) => file.path === state.selectedDatasetPath));
+}
+
+function renderDatasetFileDetail(file) {
+  const host = $("#dataset-file-detail");
+  host.replaceChildren();
+  if (!file) return;
+  host.append(el("div", "break-all text-[12px] font-semibold", file.path));
+  host.append(el("div", "mt-1 text-[10px] text-dim", `${formatBytes(file.size)} · ${file.type || "file"}`));
+  if (file.error) {
+    host.append(el("div", "mt-4 rounded border border-err/40 bg-err-dim/20 p-2 text-[11px] text-err whitespace-pre-wrap", file.error));
+    return;
+  }
+
+  const inspection = file.inspection || {};
+  if (inspection.kind === "table") renderTableInspection(host, inspection);
+  else if (inspection.kind === "database") renderDatabaseInspection(host, inspection);
+  else if (inspection.kind === "text") {
+    host.append(el("div", "mt-4 text-[10px] uppercase tracking-wide text-dim", inspection.truncated ? "Text preview · truncated" : "Text preview"));
+    host.append(el("pre", "mt-2 whitespace-pre-wrap break-words text-[10.5px] text-fg-dim", inspection.preview || "Empty file"));
+  } else if (inspection.kind === "image") {
+    host.append(el("div", "mt-4 text-[11px] text-fg-dim", `${inspection.width} × ${inspection.height} px · ${inspection.mode}`));
+  } else {
+    host.append(el("div", "mt-4 text-[11px] text-faint", "No preview is available for this file type."));
+  }
+}
+
+function renderTableInspection(host, inspection) {
+  const metrics = el("div", "grid grid-cols-2 gap-2 mt-4");
+  const rowValue = inspection.rows === null ? "Unknown" : Number(inspection.rows).toLocaleString();
+  metrics.append(
+    buildDatasetMetric("Rows", rowValue),
+    buildDatasetMetric("Columns", String(inspection.columns?.length || 0)),
+    buildDatasetMetric("Sampled", Number(inspection.sample_rows || 0).toLocaleString()),
+    buildDatasetMetric("Sheets", inspection.sheets?.length ? String(inspection.sheets.length) : "n/a"),
+  );
+  host.appendChild(metrics);
+  if (inspection.sheets?.length) {
+    host.append(el("div", "mt-4 text-[10px] uppercase tracking-wide text-dim", "Sheets"));
+    host.append(el("div", "mt-1 text-[10.5px] text-fg-dim break-words", inspection.sheets.join(" · ")));
+  }
+  host.append(el("div", "mt-4 text-[10px] uppercase tracking-wide text-dim", "Schema"));
+  const schema = el("div", "mt-2 overflow-x-auto");
+  schema.appendChild(buildDataTable(
+    ["Column", "Type", "Null", "Unique"],
+    (inspection.columns || []).map((column) => [column.name, column.dtype, column.nulls_in_sample ?? "-", column.unique_in_sample ?? "-"]),
+  ));
+  host.appendChild(schema);
+  host.append(el("div", "mt-4 text-[10px] uppercase tracking-wide text-dim", "First rows"));
+  const previewColumns = inspection.columns?.map((column) => column.name) || [];
+  const preview = el("div", "mt-2 overflow-auto max-h-72");
+  preview.appendChild(buildDataTable(previewColumns, (inspection.preview || []).map((row) => previewColumns.map((column) => row[column]))));
+  host.appendChild(preview);
+}
+
+function renderDatabaseInspection(host, inspection) {
+  host.append(el("div", "mt-4 text-[10px] uppercase tracking-wide text-dim", `${inspection.tables?.length || 0} tables`));
+  (inspection.tables || []).forEach((table) => {
+    const section = el("section", "mt-3 rounded border border-line p-2");
+    section.append(el("div", "text-[11px] font-semibold break-all", table.name));
+    section.append(el("div", "mt-0.5 text-[9.5px] text-dim", `${Number(table.rows).toLocaleString()} rows · ${table.columns?.length || 0} columns`));
+    section.append(el("div", "mt-2 text-[10px] text-fg-dim break-words", (table.columns || []).map((column) => `${column.name} (${column.dtype || "untyped"})`).join(" · ")));
+    host.appendChild(section);
+  });
+}
+
+function buildDatasetMetric(label, value) {
+  const box = el("div", "rounded border border-line bg-bg p-2");
+  box.append(el("div", "text-[9px] uppercase tracking-wide text-faint", label), el("div", "mt-0.5 text-[11.5px]", value));
+  return box;
+}
+
+function buildDataTable(columns, rows) {
+  const table = el("table", "w-full text-[10px] border-collapse");
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  columns.forEach((column) => headRow.appendChild(el("th", "sticky top-0 bg-panel-raised border border-line px-2 py-1 text-left whitespace-nowrap", String(column))));
+  head.appendChild(headRow);
+  const body = document.createElement("tbody");
+  rows.forEach((row) => {
+    const tr = document.createElement("tr");
+    row.forEach((value) => tr.appendChild(el("td", "border border-line px-2 py-1 align-top whitespace-nowrap", formatDatasetValue(value))));
+    body.appendChild(tr);
+  });
+  table.append(head, body);
+  return table;
+}
+
+function formatDatasetValue(value) {
+  if (value === null || value === undefined) return "∅";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
 
 function renderSessionHeader(session) {
@@ -537,9 +829,11 @@ function updateComposerAvailability() {
 
 const KNOWN_EVENTS = [
   "status", "progress", "kernel_replay_started", "kernel_replay_progress", "kernel_replay_finished",
+  "dataset_manifest",
   "cells_stale", "note", "user_request", "cell_created", "cell_revised",
   "execution_started", "execution_output", "execution_finished",
   "draft_started", "draft_delta", "draft_finished", "draft_discarded", "model_retry",
+  "package_install_started", "package_install_output", "package_install_finished",
   "error", "complete", "question",
 ];
 
@@ -568,6 +862,9 @@ function applyEvent(type, data) {
       break;
     case "progress":
       applyTimelineEntry({type: "note", event: "progress", message: data.message});
+      break;
+    case "dataset_manifest":
+      renderDatasetExplorer(data.manifest);
       break;
     case "kernel_replay_started":
       applySessionStatus(
@@ -630,6 +927,22 @@ function applyEvent(type, data) {
     case "model_retry":
       applySessionStatus("running", data.message || `Retrying model request in ${data.delay}s`, true);
       break;
+    case "package_install_started":
+      applySessionStatus("running", `Installing ${(data.specs || []).join(", ")}`, true);
+      applyTimelineEntry({type: "note", event: "package_install_started", specs: data.specs});
+      break;
+    case "package_install_output":
+      setStatus("running", data.line);
+      break;
+    case "package_install_finished":
+      loadPackages();
+      applyTimelineEntry({
+        type: "note",
+        event: "package_install_finished",
+        status: data.status,
+        message: data.message,
+      });
+      break;
     case "error":
       clearPendingDraft();
       applyTimelineEntry({type: "error", message: data.message});
@@ -687,7 +1000,8 @@ function buildRequestNode(entry) {
 }
 
 function buildNoteNode(entry) {
-  const wrap = el("div", "flex gap-2 px-1 text-[12px] text-dim");
+  const isError = entry.event === "package_install_finished" && entry.status === "error";
+  const wrap = el("div", `flex gap-2 px-1 text-[12px] ${isError ? "text-err" : "text-dim"}`);
   wrap.append(el("span", "text-faint shrink-0", "→"));
   wrap.append(el("span", "", noteMessage(entry)));
   return wrap;
@@ -701,6 +1015,8 @@ function noteMessage(entry) {
       return `Rebuilding kernel ${entry.current}/${entry.total}`;
     case "kernel_replay_finished":
       return "Kernel state restored";
+    case "package_install_started":
+      return `Installing ${(entry.specs || []).join(", ")}`;
     default:
       return entry.message || "";
   }
@@ -907,10 +1223,13 @@ function buildOutputNode(output) {
   if (["stdout", "stderr", "error", "result"].includes(type)) {
     wrapper.appendChild(el("pre", "whitespace-pre-wrap font-mono text-[12px]", output.text || output.message || ""));
   } else if (type === "image") {
+    const src = `/api/sessions/${state.sessionId}/artifacts/${encodeURIComponent(output.path)}`;
     const img = document.createElement("img");
-    img.src = `/api/sessions/${state.sessionId}/artifacts/${encodeURIComponent(output.path)}`;
+    img.src = src;
     img.alt = output.alt || "Generated plot";
-    img.className = "max-w-full rounded border border-line";
+    img.title = "Click to enlarge";
+    img.className = "max-w-full rounded border border-line cursor-zoom-in hover:opacity-90";
+    img.addEventListener("click", () => openLightbox(src, output.alt));
     wrapper.appendChild(img);
   } else if (type === "table") {
     const scroll = el("div", "overflow-x-auto max-h-96");

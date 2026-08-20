@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from quanta.datasets import column_brief, inspect_dataset, normalize_dataset_ref
+from quanta.datasets import column_brief, compact_manifest, inspect_dataset, normalize_dataset_ref
 
 
 @pytest.mark.parametrize(
@@ -69,3 +69,37 @@ def test_column_brief_empty_for_manifest_without_tables(tmp_path: Path) -> None:
     manifest = inspect_dataset(tmp_path)
 
     assert column_brief(manifest) == ""
+
+
+def test_compact_manifest_is_valid_and_samples_every_directory() -> None:
+    files = []
+    for directory in ("Car/train", "Car/valid", "Truck/train", "Truck/valid"):
+        files.extend(
+            {
+                "path": f"{directory}/{index:05}.jpg",
+                "size": 1024,
+                "type": "jpg",
+                "inspection": {"kind": "image", "width": 256, "height": 256, "mode": "RGB"},
+            }
+            for index in range(2500)
+        )
+    manifest = {
+        "root": "/tmp/dataset",
+        "file_count": len(files),
+        "total_bytes": sum(file["size"] for file in files),
+        "files": files,
+        "errors": [],
+    }
+
+    serialized = compact_manifest(manifest)
+    compact = json.loads(serialized)
+
+    assert len(serialized) <= 60_000
+    assert compact["omitted_file_count"] > 0
+    sampled_paths = [file["path"] for file in compact["files"]]
+    assert all(any(path.startswith(directory) for path in sampled_paths) for directory in (
+        "Car/train",
+        "Car/valid",
+        "Truck/train",
+        "Truck/valid",
+    ))
