@@ -23,6 +23,7 @@ from PIL import Image
 DATASET_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 TABULAR_SUFFIXES = {".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".parquet", ".xlsx", ".xls"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+_MANIFEST_CHAR_LIMIT = 60_000
 
 
 def normalize_dataset_ref(value: str) -> str:
@@ -252,7 +253,87 @@ def _inspect_sqlite(path: Path) -> dict[str, Any]:
 
 def compact_manifest(manifest: dict[str, Any]) -> str:
     compact = {**manifest, "root": "DATASET_DIR"}
-    return json.dumps(compact, indent=2, ensure_ascii=True)[:60000]
+    serialized = _serialize_manifest(compact)
+    if len(serialized) <= _MANIFEST_CHAR_LIMIT:
+        return serialized
+
+    files = manifest.get("files", [])
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for file in files:
+        path = Path(str(file.get("path", "")))
+        key = (path.parent.as_posix(), str(file.get("type", "file")))
+        grouped.setdefault(key, []).append(file)
+
+    group_summaries = [
+        {
+            "directory": directory,
+            "type": file_type,
+            "file_count": len(items),
+            "total_bytes": sum(int(item.get("size", 0)) for item in items),
+        }
+        for (directory, file_type), items in grouped.items()
+    ]
+    reduced: dict[str, Any] = {
+        "root": "DATASET_DIR",
+        "file_count": manifest.get("file_count", len(files)),
+        "total_bytes": manifest.get("total_bytes", 0),
+        "errors": [],
+        "omitted_error_count": len(manifest.get("errors", [])),
+        "file_groups": group_summaries[:200],
+        "omitted_file_group_count": max(0, len(group_summaries) - 200),
+        "files": [],
+        "omitted_file_count": len(files),
+    }
+    while len(_serialize_manifest(reduced)) > _MANIFEST_CHAR_LIMIT and reduced["file_groups"]:
+        reduced["file_groups"].pop()
+        reduced["omitted_file_group_count"] += 1
+
+    for error in manifest.get("errors", []):
+        candidate = {**reduced, "errors": [*reduced["errors"], error]}
+        candidate["omitted_error_count"] -= 1
+        if len(_serialize_manifest(candidate)) > _MANIFEST_CHAR_LIMIT:
+            break
+        reduced = candidate
+
+    representative_files: list[dict[str, Any]] = []
+    for index in range(max((len(items) for items in grouped.values()), default=0)):
+        representative_files.extend(items[index] for items in grouped.values() if index < len(items))
+
+    for file in representative_files:
+        detail = file
+        candidate = {**reduced, "files": [*reduced["files"], detail]}
+        candidate["omitted_file_count"] -= 1
+        if len(_serialize_manifest(candidate)) > _MANIFEST_CHAR_LIMIT:
+            detail = _manifest_file_brief(file)
+            candidate = {**reduced, "files": [*reduced["files"], detail]}
+            candidate["omitted_file_count"] -= 1
+        if len(_serialize_manifest(candidate)) > _MANIFEST_CHAR_LIMIT:
+            break
+        reduced = candidate
+    return _serialize_manifest(reduced)
+
+
+def _serialize_manifest(manifest: dict[str, Any]) -> str:
+    return json.dumps(manifest, indent=2, ensure_ascii=True)
+
+
+def _manifest_file_brief(file: dict[str, Any]) -> dict[str, Any]:
+    brief: dict[str, Any] = {key: file[key] for key in ("path", "size", "type", "error") if key in file}
+    inspection = file.get("inspection") or {}
+    kind = inspection.get("kind")
+    if kind == "table":
+        brief["inspection"] = {
+            key: inspection[key]
+            for key in ("kind", "rows", "sample_rows", "columns", "sheets")
+            if key in inspection
+        }
+    elif kind == "text":
+        brief["inspection"] = {
+            key: inspection[key] for key in ("kind", "truncated") if key in inspection
+        }
+    elif inspection:
+        brief["inspection"] = inspection
+    return brief
 
 
 def column_brief(manifest: dict[str, Any]) -> str:

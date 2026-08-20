@@ -16,9 +16,10 @@ from typing import Any
 
 
 class KernelManager:
-    def __init__(self, timeout: int = 120, max_output_chars: int = 200_000):
+    def __init__(self, timeout: int = 120, max_output_chars: int = 200_000, packages_dir: Path | None = None):
         self.timeout = timeout
         self.max_output_chars = max_output_chars
+        self.packages_dir = packages_dir
         self._workers: dict[str, KernelProcess] = {}
         self._lock = threading.Lock()
 
@@ -51,32 +52,47 @@ class KernelManager:
         for worker in workers:
             worker.stop()
 
+    def mark_all_stale(self) -> None:
+        """Flag every live worker to refresh its import caches before its next execute.
+
+        Called after a package install/uninstall so sessions other than the one
+        that triggered it also see the change, without losing their kernel state.
+        """
+        with self._lock:
+            workers = list(self._workers.values())
+        for worker in workers:
+            worker.mark_stale()
+
     def _get_worker(self, session_id: str, work_dir: Path, artifact_dir: Path) -> KernelProcess:
         with self._lock:
             worker = self._workers.get(session_id)
             if worker is None or not worker.alive:
-                worker = KernelProcess(work_dir, artifact_dir)
+                worker = KernelProcess(work_dir, artifact_dir, self.packages_dir)
                 self._workers[session_id] = worker
             return worker
 
 
 class KernelProcess:
-    def __init__(self, work_dir: Path, artifact_dir: Path):
+    def __init__(self, work_dir: Path, artifact_dir: Path, packages_dir: Path | None = None):
         artifact_dir.mkdir(parents=True, exist_ok=True)
         context = mp.get_context("spawn")
         self.commands: Any = context.Queue()
         self.results: Any = context.Queue()
         self.process = context.Process(
             target=_worker_main,
-            args=(self.commands, self.results, str(work_dir), str(artifact_dir)),
+            args=(self.commands, self.results, str(work_dir), str(artifact_dir), str(packages_dir or "")),
             daemon=True,
         )
         self.process.start()
         self.lock = threading.Lock()
+        self._stale = False
 
     @property
     def alive(self) -> bool:
         return self.process.is_alive()
+
+    def mark_stale(self) -> None:
+        self._stale = True
 
     def execute(
         self,
@@ -89,6 +105,13 @@ class KernelProcess:
         outputs: list[dict[str, Any]] = []
         output_chars = 0
         with self.lock:
+            if self._stale:
+                # A package was installed/uninstalled since this worker started;
+                # refresh its import caches before running the next cell. Sent
+                # without an id, so the correlation check below silently ignores
+                # any stray reply (the worker doesn't send one).
+                self.commands.put({"type": "refresh"})
+                self._stale = False
             self.commands.put({"type": "execute", "id": request_id, "source": source})
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
@@ -149,9 +172,16 @@ class _QueueStream(io.TextIOBase):
         return None
 
 
-def _worker_main(commands: Any, results: Any, work_dir: str, artifact_dir: str) -> None:
+def _worker_main(commands: Any, results: Any, work_dir: str, artifact_dir: str, packages_dir: str = "") -> None:
     os.chdir(work_dir)
     _set_resource_limits()
+    if packages_dir:
+        # Appended, not prepended: the app's own site-packages must always
+        # resolve pandas/numpy/matplotlib first. Only genuinely new top-level
+        # packages installed via the in-app package manager come from here.
+        import sys
+
+        sys.path.append(packages_dir)
     import matplotlib
 
     matplotlib.use("Agg")
@@ -168,8 +198,14 @@ def _worker_main(commands: Any, results: Any, work_dir: str, artifact_dir: str) 
     }
     while True:
         command = commands.get()
-        if command.get("type") == "stop":
+        command_type = command.get("type")
+        if command_type == "stop":
             return
+        if command_type == "refresh":
+            import importlib
+
+            importlib.invalidate_caches()
+            continue
         request_id = command["id"]
         stdout = _QueueStream(results, request_id, "stdout")
         stderr = _QueueStream(results, request_id, "stderr")

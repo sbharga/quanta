@@ -25,6 +25,7 @@ from quanta.db import Store
 from quanta.events import EventSink
 from quanta.kernel import KernelManager
 from quanta.notebook import NotebookService
+from quanta.packages import PackageBackendUnavailable, PackageManager, canonical_name, normalize_spec, package_name
 from quanta.settings import RuntimeSettings
 
 
@@ -37,6 +38,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         config = Config(
             data_dir=Path(test_config.get("DATA_DIR", config.data_dir)),
             database_path=Path(test_config.get("DATABASE_PATH", config.database_path)),
+            packages_dir=Path(test_config.get("PACKAGES_DIR", config.packages_dir)),
             llm_api_key=test_config.get("LLM_API_KEY", config.llm_api_key),
             llm_model=test_config.get("LLM_MODEL", config.llm_model),
             llm_base_url=test_config.get("LLM_BASE_URL", config.llm_base_url),
@@ -44,11 +46,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             max_iterations=test_config.get("MAX_ITERATIONS", config.max_iterations),
             max_download_bytes=test_config.get("MAX_DOWNLOAD_BYTES", config.max_download_bytes),
             max_output_chars=test_config.get("MAX_OUTPUT_CHARS", config.max_output_chars),
-            model_min_interval=test_config.get("MODEL_MIN_INTERVAL", config.model_min_interval),
+            model_timeout=test_config.get("MODEL_TIMEOUT", config.model_timeout),
             model_max_retries=test_config.get("MODEL_MAX_RETRIES", config.model_max_retries),
         )
         config.data_dir.mkdir(parents=True, exist_ok=True)
         config.database_path.parent.mkdir(parents=True, exist_ok=True)
+        config.packages_dir.mkdir(parents=True, exist_ok=True)
     store = Store(config.database_path)
     store.initialize()
     store.reconcile_interrupted_sessions()
@@ -60,9 +63,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         config.llm_base_url,
         config.llm_api_key,
     )
-    kernels = KernelManager(config.execution_timeout, config.max_output_chars)
+    packages = PackageManager(config.packages_dir)
+    kernels = KernelManager(config.execution_timeout, config.max_output_chars, config.packages_dir)
     notebook = NotebookService(config, store, events, kernels)
-    engine = AnalysisEngine(config, store, events, notebook, settings)
+    engine = AnalysisEngine(config, store, events, notebook, settings, packages)
     runs = RunManager(engine, store, events)
     app.extensions["quanta"] = {
         "config": config,
@@ -71,6 +75,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         "kernels": kernels,
         "notebook": notebook,
         "settings": settings,
+        "packages": packages,
         "engine": engine,
         "runs": runs,
     }
@@ -104,6 +109,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             llm_base_url=base_url if "llm_base_url" in body else None,
         )
         return jsonify(updated)
+
+    @app.get("/api/packages")
+    def list_packages() -> Response:
+        return jsonify({"packages": store.list_packages(), "backend_available": packages.backend_available()})
 
     @app.get("/api/sessions")
     def list_sessions() -> Response:
@@ -229,6 +238,84 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 events.emit(session_id, "error", message=f"{type(exc).__name__}: {exc}")
 
         if not runs.run_manual(session_id, execute):
+            return jsonify({"error": "Wait for the current run to pause or finish"}), 409
+        return jsonify({"started": True}), 202
+
+    @app.post("/api/sessions/<session_id>/packages")
+    def install_packages(session_id: str) -> tuple[Response, int] | Response:
+        try:
+            store.get_session(session_id)
+        except KeyError:
+            abort(404)
+        body = request.get_json(silent=True) or {}
+        specs = body.get("specs")
+        if not isinstance(specs, list) or not specs:
+            return jsonify({"error": "At least one package is required"}), 400
+        try:
+            specs = [normalize_spec(str(spec)) for spec in specs]
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        def install() -> None:
+            def progress(line: str) -> None:
+                events.emit(session_id, "package_install_output", line=line)
+
+            events.emit(session_id, "package_install_started", specs=specs)
+            try:
+                result = packages.install(specs, progress)
+            except PackageBackendUnavailable as exc:
+                events.emit(session_id, "package_install_finished", status="error", packages=[], message=str(exc))
+                return
+            status = result["status"]
+            message = f"Installed {', '.join(specs)}" if status == "ok" else f"Failed to install {', '.join(specs)}"
+            if status == "ok":
+                installed_by_name = {
+                    canonical_name(package["name"]): package["version"] for package in result["packages"]
+                }
+                for spec in specs:
+                    name = canonical_name(package_name(spec))
+                    store.record_package(name, spec, installed_by_name.get(name), "user", session_id)
+                kernels.mark_all_stale()
+            events.emit(
+                session_id, "package_install_finished", status=status, packages=result["packages"], message=message
+            )
+
+        if not runs.run_manual(session_id, install, message="Installing packages"):
+            return jsonify({"error": "Wait for the current run to pause or finish"}), 409
+        return jsonify({"started": True}), 202
+
+    @app.delete("/api/sessions/<session_id>/packages/<name>")
+    def uninstall_package(session_id: str, name: str) -> tuple[Response, int] | Response:
+        try:
+            store.get_session(session_id)
+        except KeyError:
+            abort(404)
+        try:
+            name = normalize_spec(name)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        def uninstall() -> None:
+            def progress(line: str) -> None:
+                events.emit(session_id, "package_install_output", line=line)
+
+            events.emit(session_id, "package_install_started", specs=[f"uninstall {name}"])
+            try:
+                result = packages.uninstall(name, progress)
+            except PackageBackendUnavailable as exc:
+                events.emit(session_id, "package_install_finished", status="error", packages=[], message=str(exc))
+                return
+            status = result["status"]
+            if status == "ok":
+                store.forget_package(canonical_name(package_name(name)))
+                kernels.stop(session_id)
+                kernels.mark_all_stale()
+            message = f"Removed {name}" if status == "ok" else f"Failed to remove {name}"
+            events.emit(
+                session_id, "package_install_finished", status=status, packages=result["packages"], message=message
+            )
+
+        if not runs.run_manual(session_id, uninstall, message="Removing package"):
             return jsonify({"error": "Wait for the current run to pause or finish"}), 409
         return jsonify({"started": True}), 202
 

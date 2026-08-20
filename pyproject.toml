@@ -55,6 +55,7 @@ ignore = ["BLE001", "S102"]
 [tool.mypy]
 python_version = "3.14"
 ignore_missing_imports = true
+exclude = ["src/instance/"]
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

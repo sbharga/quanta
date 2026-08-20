@@ -9,6 +9,7 @@ from pathlib import Path
 class Config:
     data_dir: Path
     database_path: Path
+    packages_dir: Path
     llm_api_key: str | None
     llm_model: str
     llm_base_url: str
@@ -16,16 +17,19 @@ class Config:
     max_iterations: int
     max_download_bytes: int
     max_output_chars: int
-    model_min_interval: float
+    model_timeout: float
     model_max_retries: int
 
     @classmethod
     def from_env(cls, instance_path: str | Path) -> Config:
         root = Path(os.environ.get("QUANTA_DATA_DIR", instance_path)).resolve()
         root.mkdir(parents=True, exist_ok=True)
+        packages_dir = Path(os.environ.get("QUANTA_PACKAGES_DIR", root / "packages")).resolve()
+        packages_dir.mkdir(parents=True, exist_ok=True)
         return cls(
             data_dir=root,
             database_path=root / "quanta.sqlite3",
+            packages_dir=packages_dir,
             llm_api_key=os.environ.get("LLM_API_KEY"),
             llm_model=os.environ.get("LLM_MODEL", "openai/gpt-4o-mini"),
             llm_base_url=os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
@@ -33,7 +37,7 @@ class Config:
             max_iterations=int(os.environ.get("QUANTA_MAX_ITERATIONS", "12")),
             max_download_bytes=int(os.environ.get("QUANTA_MAX_DOWNLOAD_BYTES", str(5 * 1024**3))),
             max_output_chars=int(os.environ.get("QUANTA_MAX_OUTPUT_CHARS", "200000")),
-            model_min_interval=float(os.environ.get("QUANTA_MODEL_MIN_INTERVAL", "2")),
+            model_timeout=float(os.environ.get("QUANTA_MODEL_TIMEOUT", "60")),
             model_max_retries=int(os.environ.get("QUANTA_MODEL_MAX_RETRIES", "3")),
         )
 

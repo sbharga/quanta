@@ -118,3 +118,47 @@ def test_delete_session_raises_for_unknown_id(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("expected KeyError")
+
+
+def test_package_rows_survive_session_delete(tmp_path: Path) -> None:
+    # The shared package environment outlives any single session, so deleting
+    # the session that happened to trigger an install must not delete the
+    # record of a package still installed on disk — hence ON DELETE SET NULL
+    # on packages.session_id, unlike every other table's ON DELETE CASCADE.
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    session = store.create_session("owner/dataset")
+    store.record_package("seaborn", "seaborn==0.13.2", "0.13.2", "user", session["id"])
+
+    store.delete_session(session["id"])
+
+    packages = store.list_packages()
+    assert len(packages) == 1
+    assert packages[0]["name"] == "seaborn"
+    assert packages[0]["session_id"] is None
+
+
+def test_record_package_upserts_on_reinstall(tmp_path: Path) -> None:
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    session = store.create_session("owner/dataset")
+    store.record_package("seaborn", "seaborn==0.12.0", "0.12.0", "user", session["id"])
+
+    store.record_package("seaborn", "seaborn==0.13.2", "0.13.2", "assistant", session["id"])
+
+    packages = store.list_packages()
+    assert len(packages) == 1
+    assert packages[0]["requirement"] == "seaborn==0.13.2"
+    assert packages[0]["version"] == "0.13.2"
+    assert packages[0]["author"] == "assistant"
+
+
+def test_forget_package_removes_row(tmp_path: Path) -> None:
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    session = store.create_session("owner/dataset")
+    store.record_package("seaborn", "seaborn==0.13.2", "0.13.2", "user", session["id"])
+
+    store.forget_package("seaborn")
+
+    assert store.list_packages() == []

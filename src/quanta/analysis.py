@@ -28,6 +28,7 @@ from quanta.datasets import (
 from quanta.db import Store
 from quanta.events import EventSink
 from quanta.notebook import NotebookService
+from quanta.packages import PackageBackendUnavailable, PackageManager, canonical_name, package_name
 from quanta.settings import RuntimeSettings
 
 
@@ -39,10 +40,11 @@ class AnalysisState(TypedDict, total=False):
     suggestions: list[str]
     decision: dict[str, Any]
     recent_result: dict[str, Any]
-    last_text_cell: dict[str, Any]
+    recent_install_result: dict[str, Any]
     iterations: int
     completion_message: str
     unchanged_generations: int
+    failed_installs: list[str]
 
 
 class DatasetBrief(BaseModel):
@@ -53,10 +55,21 @@ class DatasetBrief(BaseModel):
 
 
 class AnalystDecision(BaseModel):
-    action: Literal["create", "edit", "rerun", "text", "ask", "finish"]
+    action: Literal["create", "edit", "rerun", "ask", "install", "finish"]
     rationale: str = Field(description="One or two sentences on why this action follows from the notebook so far")
     instruction: str = Field(description="What to write, change, run, explain, or ask")
+    narration: str = Field(
+        default="",
+        description=(
+            "Optional concise Markdown interpretation of the latest executed code cell. Leave empty if the latest "
+            "notebook cell is already Markdown or no new result needs explanation."
+        ),
+    )
     target_cell_id: str | None = Field(default=None, description="Existing cell ID for edit or rerun")
+    packages: list[str] = Field(
+        default_factory=list,
+        description="Package requirements to install (e.g. 'seaborn', 'scikit-learn==1.5.0'), only when action is install",
+    )
 
 
 class AnalysisCancelled(RuntimeError):
@@ -74,19 +87,19 @@ class AnalysisEngine:
         events: EventSink,
         notebook: NotebookService,
         settings: RuntimeSettings,
+        packages: PackageManager,
     ):
         self.config = config
         self.store = store
         self.events = events
         self.notebook = notebook
         self.settings = settings
+        self.packages = packages
         self._model_instance: ChatOpenAI | None = None
         self._model_signature: tuple[str, str, str] | None = None
         self._model_lock = threading.Lock()
         self._cancelled: set[str] = set()
         self._cancel_lock = threading.Lock()
-        self._model_schedule_lock = threading.Lock()
-        self._next_model_call = 0.0
         connection = sqlite3.connect(config.database_path, check_same_thread=False)
         self.checkpointer = SqliteSaver(connection)
         self.graph = self._build_graph().compile(checkpointer=self.checkpointer)
@@ -100,8 +113,8 @@ class AnalysisEngine:
         graph.add_node("decide", self._decide)
         graph.add_node("generate_code", self._generate_code)
         graph.add_node("execute", self._execute)
-        graph.add_node("generate_text", self._generate_text)
         graph.add_node("ask", self._ask)
+        graph.add_node("install", self._install)
         graph.add_node("finish", self._finish)
         graph.add_edge(START, "load")
         graph.add_conditional_edges("load", self._route_load, ["ingest", "collect_request", "decide"])
@@ -111,12 +124,12 @@ class AnalysisEngine:
         graph.add_conditional_edges(
             "decide",
             self._route_decision,
-            ["generate_code", "execute", "generate_text", "ask", "finish"],
+            ["generate_code", "execute", "ask", "install", "finish"],
         )
         graph.add_conditional_edges("generate_code", self._route_after_generate, ["execute", "decide"])
         graph.add_conditional_edges("execute", self._route_after_step, ["decide", "finish"])
-        graph.add_conditional_edges("generate_text", self._route_after_step, ["decide", "finish"])
         graph.add_conditional_edges("ask", self._route_after_step, ["decide", "finish"])
+        graph.add_conditional_edges("install", self._route_after_step, ["decide", "finish"])
         graph.add_edge("finish", END)
         return graph
 
@@ -220,6 +233,7 @@ class AnalysisEngine:
         if requests and requests[-1]["content"] == state.get("user_request"):
             requests = requests[:-1]
         history = "\n".join(f"- {item['content']}" for item in requests)
+        installed = _installed_packages_brief(self.packages)
         structured = model.with_structured_output(AnalystDecision, method="function_calling")
         decision = self._invoke_model(
             session_id,
@@ -233,8 +247,9 @@ class AnalysisEngine:
                             f"Conversation requests:\n{history or '(none)'}\n\n"
                             f"Current user request:\n{state.get('user_request', '')}\n\n"
                             f"Notebook so far:\n{context}\n\n"
-                            f"Most recent execution:\n{json.dumps(state.get('recent_result', {}), default=str)[:12000]}\n\n"
-                            f"Most recent narrative cell:\n{json.dumps(state.get('last_text_cell', {}), default=str)[:2000]}"
+                            f"Installed packages beyond the standard library: {installed}\n\n"
+                            f"Most recent package-install result: "
+                            f"{json.dumps(state.get('recent_install_result', {}), default=str)[:2000]}"
                         )
                     ),
                 ]
@@ -243,6 +258,10 @@ class AnalysisEngine:
         assert isinstance(decision, AnalystDecision)  # guaranteed by with_structured_output's schema
         payload = decision.model_dump()
         self.events.emit(session_id, "agent_decision", **payload)
+        narration = payload["narration"].strip()
+        latest_cell = cells[-1] if cells else None
+        if narration and latest_cell and latest_cell["kind"] == "code" and latest_cell["executions"]:
+            self.notebook.create_cell(session_id, "markdown", narration)
         return {"decision": payload, "iterations": state.get("iterations", 0) + 1}
 
     def _route_decision(self, state: AnalysisState) -> str:
@@ -251,10 +270,10 @@ class AnalysisEngine:
             return "generate_code"
         if action == "rerun":
             return "execute"
-        if action == "text":
-            return "generate_text"
         if action == "ask":
             return "ask"
+        if action == "install":
+            return "install"
         return "finish"
 
     def _generate_code(self, state: AnalysisState) -> AnalysisState:
@@ -274,6 +293,7 @@ class AnalysisEngine:
             columns=columns,
             target=target,
             recent_result=state.get("recent_result", {}),
+            installed=_installed_packages_brief(self.packages),
         )
         source = self._stream_model(
             session_id,
@@ -331,23 +351,6 @@ class AnalysisEngine:
         self._check_cancelled(session_id)
         return {"recent_result": {"cell_id": cell_id, **result}}
 
-    def _generate_text(self, state: AnalysisState) -> AnalysisState:
-        session_id = state["session_id"]
-        self._check_cancelled(session_id)
-        prompt = (
-            "Write a concise notebook Markdown cell explaining the analysis result. "
-            "Do not claim facts not present in the execution output.\n\n"
-            f"Instruction: {state['decision']['instruction']}\n"
-            f"Latest output: {json.dumps(state.get('recent_result', {}), default=str)[:12000]}"
-        )
-        source = self._stream_model(session_id, "text", prompt, action="create")
-        cell = self.notebook.create_cell(session_id, "markdown", source)
-        # Deliberately leave `recent_result` untouched: it still holds the last
-        # execution's real output, which `_decide` needs on the next turn.
-        # Clobbering it with the narrative cell was why the agent kept
-        # re-running analysis it had just explained.
-        return {"last_text_cell": {"cell_id": cell["id"], "source": source}}
-
     def _ask(self, state: AnalysisState) -> AnalysisState:
         session_id = state["session_id"]
         question = state["decision"]["instruction"]
@@ -357,6 +360,72 @@ class AnalysisEngine:
         self.store.add_request(session_id, str(answer))
         self.events.emit(session_id, "user_request", content=str(answer))
         return {"user_request": request}
+
+    def _install(self, state: AnalysisState) -> AnalysisState:
+        session_id = state["session_id"]
+        self._check_cancelled(session_id)
+        decision = state["decision"]
+        already_failed = set(state.get("failed_installs", []))
+        specs = [spec for spec in decision.get("packages", []) if spec not in already_failed]
+        if not specs:
+            message = "The requested package already failed to install earlier this run; not retrying it."
+            self.events.emit(session_id, "note", message=message)
+            return {
+                "recent_install_result": {
+                    "status": "error",
+                    "outputs": [{"type": "error", "message": message}],
+                }
+            }
+        installed_names = {
+            canonical_name(package["name"])
+            for package in self.packages.list_installed()
+        }
+        if all(canonical_name(package_name(spec)) in installed_names for spec in specs):
+            message = f"Already installed: {', '.join(specs)}. Skipping the redundant install."
+            self.events.emit(session_id, "note", message=message)
+            return {
+                "recent_install_result": {
+                    "status": "ok",
+                    "outputs": [{"type": "result", "text": message}],
+                }
+            }
+        self.events.emit(session_id, "package_install_started", specs=specs)
+
+        def progress(line: str) -> None:
+            self.events.emit(session_id, "package_install_output", line=line)
+
+        try:
+            result = self.packages.install(specs, progress)
+        except (ValueError, PackageBackendUnavailable) as exc:
+            message = str(exc)
+            self.events.emit(session_id, "package_install_finished", status="error", packages=[], message=message)
+            return {
+                "recent_install_result": {
+                    "status": "error",
+                    "outputs": [{"type": "error", "message": message}],
+                },
+                "failed_installs": [*state.get("failed_installs", []), *specs],
+            }
+        status = result["status"]
+        message = (
+            f"Installed {', '.join(specs)}" if status == "ok" else f"Failed to install {', '.join(specs)}"
+        )
+        if status == "ok":
+            installed_by_name = {
+                canonical_name(package["name"]): package["version"] for package in result["packages"]
+            }
+            for spec in specs:
+                name = canonical_name(package_name(spec))
+                self.store.record_package(name, spec, installed_by_name.get(name), "assistant", session_id)
+            self.notebook.kernels.mark_all_stale()
+        self.events.emit(
+            session_id, "package_install_finished", status=status, packages=result["packages"], message=message
+        )
+        outputs = [{"type": "error" if status == "error" else "result", "text": result["log"] or message}]
+        update: AnalysisState = {"recent_install_result": {"status": status, "outputs": outputs}}
+        if status == "error":
+            update["failed_installs"] = [*state.get("failed_installs", []), *specs]
+        return update
 
     def _finish(self, state: AnalysisState) -> AnalysisState:
         self._check_cancelled(state["session_id"])
@@ -384,7 +453,6 @@ class AnalysisEngine:
         messages.append(HumanMessage(content=prompt))
         attempts = self.config.model_max_retries + 1
         for attempt in range(1, attempts + 1):
-            self._wait_for_model_slot(session_id)
             self.events.emit(
                 session_id,
                 "status",
@@ -432,7 +500,6 @@ class AnalysisEngine:
     def _invoke_model(self, session_id: str, message: str, operation: Callable[[], T]) -> T:
         attempts = self.config.model_max_retries + 1
         for attempt in range(1, attempts + 1):
-            self._wait_for_model_slot(session_id)
             self.events.emit(
                 session_id,
                 "status",
@@ -447,25 +514,6 @@ class AnalysisEngine:
                     raise
                 self._retry_model(session_id, exc, attempt)
         raise RuntimeError("Model request failed")
-
-    def _wait_for_model_slot(self, session_id: str) -> None:
-        with self._model_schedule_lock:
-            now = time.monotonic()
-            scheduled = max(now, self._next_model_call)
-            self._next_model_call = scheduled + self.config.model_min_interval
-        remaining = scheduled - time.monotonic()
-        if remaining > 0:
-            self.events.emit(
-                session_id,
-                "status",
-                status="running",
-                phase="model_pacing",
-                message=f"Pacing model requests for {remaining:.1f}s",
-            )
-        while remaining > 0:
-            self._check_cancelled(session_id)
-            time.sleep(min(remaining, 0.25))
-            remaining = scheduled - time.monotonic()
 
     def _retry_model(self, session_id: str, exc: Exception, attempt: int) -> None:
         retry_after = _retry_after(exc)
@@ -501,6 +549,7 @@ class AnalysisEngine:
                     api_key=SecretStr(api_key),
                     base_url=base_url,
                     temperature=0,
+                    timeout=self.config.model_timeout,
                     max_retries=0,
                 )
                 self._model_signature = signature
@@ -541,7 +590,7 @@ class RunManager:
         thread.start()
         return True
 
-    def run_manual(self, session_id: str, task: Any) -> bool:
+    def run_manual(self, session_id: str, task: Any, message: str = "Executing code") -> bool:
         with self._lock:
             if session_id in self._running:
                 return False
@@ -553,7 +602,7 @@ class RunManager:
             final_status: tuple[str, str] | None = None
             try:
                 self.store.update_session(session_id, status="running", error=None)
-                self.events.emit(session_id, "status", status="running", message="Executing code")
+                self.events.emit(session_id, "status", status="running", message=message)
                 task()
             finally:
                 if self.engine.is_cancelled(session_id):
@@ -667,6 +716,17 @@ def _cell_context(cells: list[dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+def _installed_packages_brief(packages: PackageManager) -> str:
+    """Return every installed distribution so the agent never re-requests a hidden package."""
+    try:
+        names = sorted(package["name"] for package in packages.list_installed())
+    except OSError:
+        return "(none)"
+    if not names:
+        return "(none)"
+    return ", ".join(names)
+
+
 def _code_generation_prompt(
     *,
     instruction: str,
@@ -674,12 +734,14 @@ def _code_generation_prompt(
     columns: str,
     target: dict[str, Any] | None,
     recent_result: dict[str, Any],
+    installed: str = "(none)",
 ) -> str:
     prompt = (
         "Write one executable Python notebook cell for the requested data-analysis step. "
         "Use DATASET_DIR (a pathlib.Path) for files; pandas as pd, numpy as np, and pyplot as plt are already available. "
         "End with the key DataFrame/value expression when a table should be displayed. Return code only, without fences.\n\n"
         f"Dataset inventory:\n{compact_manifest(manifest)}\n"
+        f"\nInstalled packages beyond the standard library, pandas, NumPy, and Matplotlib: {installed}\n"
     )
     if columns:
         prompt += f"\n{columns}\n"
@@ -712,15 +774,19 @@ def _strip_code_fence(source: str) -> str:
 
 
 _ANALYST_SYSTEM = """You control an iterative data-analysis notebook. Choose exactly one next action.
-Use create to add and run a new code cell. Use edit when an earlier failed or flawed cell must be corrected, and provide its exact cell ID. Use rerun to execute an existing correct cell again. Use text to add a concise interpretation after useful output. Use ask only when essential ambiguity prevents progress. Use finish once the user's request has been answered.
-Inspect outputs before drawing conclusions. Recover from errors by editing the responsible cell. Prefer small, readable cells, bounded displays, and evidence-backed analysis. Never invent results. Do not access files outside DATASET_DIR and do not install packages.
+Use create to add and run a new code cell. Use edit when an earlier failed or flawed cell must be corrected, and provide its exact cell ID. Use rerun to execute an existing correct cell again. Use ask only when essential ambiguity prevents progress. Use install when a cell needs a third-party package that is not already installed — list the exact requirement(s) (e.g. "seaborn", "scikit-learn==1.5.0") in packages, and prefer the standard library, pandas, NumPy, or Matplotlib whenever they already cover the need. Use finish once the user's request has been answered.
+When the latest notebook cell is executed code with useful output that has not yet been explained, put one concise, evidence-backed Markdown interpretation in narration while choosing the next action. Leave narration empty when the latest cell is already Markdown, when there is no new result, or when the result needs correction rather than explanation. Never repeat an interpretation.
+Inspect outputs before drawing conclusions. Recover from errors by editing the responsible cell. Prefer small, readable cells, bounded displays, and evidence-backed analysis. Never invent results. Do not access files outside DATASET_DIR.
 Before choosing create, check the notebook so far: never regenerate a cell whose output already answers the same question. If useful analysis already ran and was explained in a text cell, treat that as done and move the request forward instead of repeating it.
+Before choosing install, check the installed-packages list given to you: never request a package that is already installed, and never request install again for a package whose install already failed earlier this run.
 Visualize when it helps: prefer a chart over a text-only answer for a distribution, comparison, trend, or relationship. A dataset with numeric or categorical columns almost always has at least one chart worth showing before you finish.
 Column names may contain leading/trailing whitespace or unusual characters — the code-generation step will show you their exact repr(); always index columns exactly as given there, never by a cleaned-up guess."""
 
 _CODE_SYSTEM = """You write single, executable Python cells for a persistent notebook kernel.
-DATASET_DIR (pathlib.Path), pd, np, and plt are already imported and available; do not re-import or redefine them.
-Use only the standard library, pandas, NumPy, and Matplotlib. Do not import optional packages such as seaborn.
+DATASET_DIR (pathlib.Path), pd, np, and plt are already imported and available; do not re-import or redefine them. Read dataset files only through DATASET_DIR; never use Kaggle notebook paths such as /kaggle/input.
+You may import the standard library, pandas, NumPy, and Matplotlib, plus any package explicitly listed as installed below — nothing else. If a cell genuinely needs a package that isn't listed, do not import it; the calling agent installs packages via a separate action before code is generated.
+This is a plain Python exec kernel, not Jupyter or IPython: do not use display(), IPython imports, or notebook magics. End with a value expression or use print() for text output.
+The kernel worker is a daemonic process and cannot create child processes. Use num_workers=0 and n_jobs=1, and disable multiprocessing/joblib parallelism in any similar API.
 Column names are given to you verbatim via repr() — including any leading/trailing whitespace — and must be indexed exactly as shown, never guessed or stripped unless the task explicitly asks you to clean them.
-When a chart is appropriate: create exactly one figure with plt.figure(figsize=(9, 5)) or an equivalent axes call, always set a title and axis labels, and do not call plt.show() — every open figure is captured and displayed automatically after the cell runs.
+When a chart is appropriate: create exactly one figure with plt.figure(figsize=(9, 5)) or an equivalent axes call, always set a title and axis labels, and do not call plt.show() — every open figure is captured and displayed automatically after the cell runs. In Matplotlib boxplot(), use tick_labels= rather than the removed labels= argument.
 Return only the Python source, with no prose before or after it and no markdown fence."""

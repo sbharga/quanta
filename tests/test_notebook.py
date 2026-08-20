@@ -24,6 +24,7 @@ def make_config(tmp_path: Path) -> Config:
     return Config(
         data_dir=tmp_path,
         database_path=tmp_path / "test.sqlite3",
+        packages_dir=tmp_path / "packages",
         llm_api_key=None,
         llm_model="test/model",
         llm_base_url="https://openrouter.ai/api/v1",
@@ -31,7 +32,7 @@ def make_config(tmp_path: Path) -> Config:
         max_iterations=3,
         max_download_bytes=1000,
         max_output_chars=1000,
-        model_min_interval=0,
+        model_timeout=60,
         model_max_retries=0,
     )
 
@@ -184,3 +185,23 @@ def test_timeline_and_export_use_latest_active_revision_execution(tmp_path: Path
     assert [execution["id"] for execution in cell_entry["cell"]["executions"]] == [latest["id"]]
     exported = notebook.export_notebook(session["id"])["cells"][0]
     assert exported["outputs"][0]["data"]["text/plain"] == ["latest"]
+
+
+def test_timeline_folds_package_events_into_notes_but_not_output_lines(tmp_path: Path) -> None:
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    config = make_config(tmp_path)
+    events = EventSink(store)
+    session = store.create_session("owner/dataset")
+    notebook = NotebookService(config, store, events, FakeKernels())  # type: ignore[arg-type]
+
+    events.emit(session["id"], "package_install_started", specs=["seaborn"])
+    events.emit(session["id"], "package_install_output", line="Resolved 1 package")
+    events.emit(session["id"], "package_install_finished", status="ok", packages=[], message="Installed seaborn")
+
+    entries = notebook.build_timeline(session["id"])["entries"]
+
+    assert [entry["type"] for entry in entries] == ["note", "note"]
+    assert entries[0]["event"] == "package_install_started"
+    assert entries[1]["event"] == "package_install_finished"
+    assert entries[1]["message"] == "Installed seaborn"
