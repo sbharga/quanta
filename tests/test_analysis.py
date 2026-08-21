@@ -10,12 +10,10 @@ import quanta.analysis as analysis_module
 from quanta.analysis import (
     AnalysisEngine,
     AnalystDecision,
-    _cell_signature,
     _code_generation_prompt,
     _installed_packages_brief,
     _is_retryable_model_error,
     _strip_code_fence,
-    _successful_code_context,
     _truncate_execution_for_prompt,
 )
 from quanta.config import Config
@@ -124,51 +122,6 @@ def test_code_prompt_puts_failure_before_required_fix() -> None:
     assert prompt.index("import seaborn as sns") < prompt.index("ModuleNotFoundError: seaborn")
     assert prompt.index("ModuleNotFoundError: seaborn") < prompt.index("Replace seaborn with matplotlib")
     assert prompt.endswith("Replace seaborn with matplotlib\n")
-
-
-def test_cell_signature_extracts_top_level_bindings() -> None:
-    source = (
-        "import pandas as pd\n"
-        "from sklearn.linear_model import LinearRegression\n\n"
-        "df = pd.read_csv('x.csv')\n\n"
-        "def plot_sales():\n    pass\n"
-    )
-
-    signature = _cell_signature(source)
-
-    assert "pd" in signature
-    assert "LinearRegression" in signature
-    assert "df" in signature
-    assert "plot_sales()" in signature
-
-
-def test_cell_signature_handles_unparsable_source() -> None:
-    assert _cell_signature("def broken(:") == "(unparsable)"
-
-
-def _make_successful_cell(cell_id: str, source: str, execution_count: int) -> dict:
-    return {
-        "id": cell_id,
-        "kind": "code",
-        "revision": 1,
-        "active_revision_id": f"rev-{cell_id}",
-        "source": source,
-        "executions": [{"revision_id": f"rev-{cell_id}", "execution_count": execution_count, "status": "ok"}],
-    }
-
-
-def test_successful_code_context_keeps_full_source_only_within_recent_window() -> None:
-    cells = [
-        _make_successful_cell("old", "old_df = 1", 1),
-        _make_successful_cell("new", "new_df = 2", 2),
-    ]
-
-    context = _successful_code_context(cells, recent_window=1)
-
-    assert "old_df = 1" not in context
-    assert "old_df" in context  # still named in the compact signature
-    assert "Earlier cell old" in context
-    assert "new_df = 2" in context
 
 
 def test_truncate_execution_for_prompt_keeps_traceback_tail() -> None:
