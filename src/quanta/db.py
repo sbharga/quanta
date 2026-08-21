@@ -44,7 +44,9 @@ class Store:
                     suggestions_json TEXT,
                     error TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS requests (
                     id TEXT PRIMARY KEY,
@@ -92,6 +94,10 @@ class Store:
                     ON events(session_id, seq);
                 CREATE INDEX IF NOT EXISTS idx_cells_session_position
                     ON cells(session_id, position);
+                CREATE INDEX IF NOT EXISTS idx_executions_session
+                    ON executions(session_id);
+                CREATE INDEX IF NOT EXISTS idx_cell_revisions_cell
+                    ON cell_revisions(cell_id);
                 CREATE TABLE IF NOT EXISTS packages (
                     name TEXT PRIMARY KEY,
                     requirement TEXT NOT NULL,
@@ -108,6 +114,10 @@ class Store:
             columns = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
             if "title" not in columns:
                 db.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+            if "prompt_tokens" not in columns:
+                db.execute("ALTER TABLE sessions ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0")
+            if "completion_tokens" not in columns:
+                db.execute("ALTER TABLE sessions ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0")
 
     def create_session(self, dataset_ref: str) -> dict[str, Any]:
         session_id = str(uuid.uuid4())
@@ -178,6 +188,20 @@ class Store:
                 f"UPDATE sessions SET {assignments} WHERE id = ?",
                 (*encoded.values(), session_id),
             )
+
+    def record_usage(self, session_id: str, prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE sessions SET prompt_tokens = prompt_tokens + ?, completion_tokens = completion_tokens + ? "
+                "WHERE id = ?",
+                (prompt_tokens, completion_tokens, session_id),
+            )
+            row = db.execute(
+                "SELECT prompt_tokens, completion_tokens FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(session_id)
+        return {"prompt_tokens": row["prompt_tokens"], "completion_tokens": row["completion_tokens"]}
 
     def delete_session(self, session_id: str) -> None:
         with self.connect() as db:
@@ -278,16 +302,17 @@ class Store:
                 (session_id,),
             ).fetchall()
             cells = [dict(row) for row in rows]
+            executions_by_cell: dict[str, list[dict[str, Any]]] = {cell["id"]: [] for cell in cells}
+            execution_rows = db.execute(
+                "SELECT * FROM executions WHERE session_id = ? ORDER BY execution_count",
+                (session_id,),
+            ).fetchall()
+            for item in execution_rows:
+                execution = {**dict(item), "outputs": _loads(item["outputs_json"]) or []}
+                execution.pop("outputs_json", None)
+                executions_by_cell.setdefault(execution["cell_id"], []).append(execution)
             for cell in cells:
-                executions = db.execute(
-                    "SELECT * FROM executions WHERE cell_id = ? ORDER BY execution_count",
-                    (cell["id"],),
-                ).fetchall()
-                cell["executions"] = [
-                    {**dict(item), "outputs": _loads(item["outputs_json"]) or []} for item in executions
-                ]
-                for execution in cell["executions"]:
-                    execution.pop("outputs_json", None)
+                cell["executions"] = executions_by_cell.get(cell["id"], [])
         return cells
 
     def start_execution(self, session_id: str, cell: dict[str, Any]) -> dict[str, Any]:

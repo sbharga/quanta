@@ -71,6 +71,31 @@ def test_column_brief_empty_for_manifest_without_tables(tmp_path: Path) -> None:
     assert column_brief(manifest) == ""
 
 
+def test_column_brief_degrades_under_a_tight_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    from quanta import datasets as datasets_module
+
+    monkeypatch.setattr(datasets_module, "_COLUMN_BRIEF_CHAR_LIMIT", 300)
+    manifest = {
+        "files": [
+            {
+                "path": f"table-{index}.csv",
+                "inspection": {
+                    "kind": "table",
+                    "columns": [{"name": f"col_{n}", "dtype": "object"} for n in range(3)],
+                },
+            }
+            for index in range(10)
+        ]
+    }
+
+    brief = column_brief(manifest)
+
+    assert "table-0.csv" in brief
+    assert "table-9.csv" not in brief  # later files dropped once the budget runs out
+    assert "omitted for length" in brief
+    assert len(brief) < len(column_brief({**manifest, "files": manifest["files"][:1]})) * 10
+
+
 def test_compact_manifest_is_valid_and_samples_every_directory() -> None:
     files = []
     for directory in ("Car/train", "Car/valid", "Truck/train", "Truck/valid"):

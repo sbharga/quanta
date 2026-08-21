@@ -21,6 +21,29 @@ def test_cell_revisions_and_executions_are_append_only(tmp_path: Path) -> None:
     assert cells[0]["executions"][0]["outputs"][0]["text"] == "1"
 
 
+def test_list_cells_groups_executions_by_cell_across_a_multi_cell_session(tmp_path: Path) -> None:
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    session = store.create_session("owner/dataset")
+    first = store.create_cell(session["id"], "code", "a = 1")
+    second = store.create_cell(session["id"], "code", "b = 2")
+
+    first_execution_1 = store.start_execution(session["id"], first)
+    store.finish_execution(first_execution_1["id"], "ok", [{"type": "result", "text": "1"}])
+    second_execution_1 = store.start_execution(session["id"], second)
+    store.finish_execution(second_execution_1["id"], "error", [{"type": "error", "message": "boom"}])
+    first_execution_2 = store.start_execution(session["id"], first)
+    store.finish_execution(first_execution_2["id"], "ok", [{"type": "result", "text": "1 again"}])
+
+    cells = store.list_cells(session["id"])
+    by_id = {cell["id"]: cell for cell in cells}
+
+    assert [execution["outputs"][0]["text"] for execution in by_id[first["id"]]["executions"]] == ["1", "1 again"]
+    assert len(by_id[second["id"]]["executions"]) == 1
+    assert by_id[second["id"]]["executions"][0]["status"] == "error"
+    assert all("outputs_json" not in execution for cell in cells for execution in cell["executions"])
+
+
 def test_events_can_be_replayed_from_cursor(tmp_path: Path) -> None:
     store = Store(tmp_path / "test.sqlite3")
     store.initialize()
@@ -61,6 +84,20 @@ def test_reconciles_executions_interrupted_by_restart(tmp_path: Path) -> None:
     assert restored["status"] == "interrupted"
     assert restored["finished_at"] is not None
     assert "interrupted" in restored["outputs"][0]["message"].lower()
+
+
+def test_record_usage_accumulates_tokens_across_calls(tmp_path: Path) -> None:
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    session = store.create_session("owner/dataset")
+
+    first = store.record_usage(session["id"], 100, 20)
+    second = store.record_usage(session["id"], 50, 10)
+
+    assert first == {"prompt_tokens": 100, "completion_tokens": 20}
+    assert second == {"prompt_tokens": 150, "completion_tokens": 30}
+    assert store.get_session(session["id"])["prompt_tokens"] == 150
+    assert store.get_session(session["id"])["completion_tokens"] == 30
 
 
 def test_session_title_round_trips(tmp_path: Path) -> None:

@@ -38,6 +38,20 @@ def test_empty_values_remove_only_saved_overrides(tmp_path: Path, monkeypatch) -
     assert result["llm_source"] == "environment"
 
 
+def test_max_iterations_falls_back_to_env_then_default(tmp_path: Path, monkeypatch) -> None:
+    settings = RuntimeSettings(tmp_path / "settings.json", "default/model", DEFAULT_BASE_URL, default_max_iterations=12)
+    assert settings.max_iterations() == 12
+
+    monkeypatch.setenv("QUANTA_MAX_ITERATIONS", "5")
+    assert settings.max_iterations() == 5
+
+    settings.update(max_iterations=3)
+    assert settings.max_iterations() == 3
+
+    settings.update(clear_max_iterations=True)
+    assert settings.max_iterations() == 5  # falls back to the env var again
+
+
 def test_base_url_falls_back_to_env_then_default(tmp_path: Path, monkeypatch) -> None:
     settings = RuntimeSettings(tmp_path / "settings.json", "default/model", DEFAULT_BASE_URL)
     assert settings.llm_base_url() == DEFAULT_BASE_URL

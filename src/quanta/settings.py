@@ -16,11 +16,13 @@ class RuntimeSettings:
         default_model: str,
         default_base_url: str,
         default_api_key: str | None = None,
+        default_max_iterations: int = 12,
     ):
         self.path = path
         self.default_model = default_model
         self.default_base_url = default_base_url
         self.default_api_key = default_api_key
+        self.default_max_iterations = default_max_iterations
         self._lock = threading.RLock()
 
     def llm_api_key(self) -> str | None:
@@ -38,6 +40,16 @@ class RuntimeSettings:
         with self._lock:
             stored = self._read().get("llm_base_url")
         return str(stored or os.environ.get("LLM_BASE_URL") or self.default_base_url)
+
+    def max_iterations(self) -> int:
+        with self._lock:
+            stored = self._read().get("max_iterations")
+        value = stored if stored is not None else os.environ.get("QUANTA_MAX_ITERATIONS")
+        try:
+            parsed = int(value) if value is not None else None
+        except (TypeError, ValueError):
+            parsed = None
+        return parsed if parsed and parsed > 0 else self.default_max_iterations
 
     def public(self) -> dict[str, Any]:
         stored = self._read()
@@ -64,6 +76,7 @@ class RuntimeSettings:
                 if kaggle_file
                 else "not configured"
             ),
+            "max_iterations": self.max_iterations(),
         }
 
     def update(
@@ -73,6 +86,8 @@ class RuntimeSettings:
         kaggle_api_token: str | None = None,
         llm_model: str | None = None,
         llm_base_url: str | None = None,
+        max_iterations: int | None = None,
+        clear_max_iterations: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
             values = self._read()
@@ -89,6 +104,10 @@ class RuntimeSettings:
                     values[key] = cleaned
                 else:
                     values.pop(key, None)
+            if clear_max_iterations:
+                values.pop("max_iterations", None)
+            elif max_iterations is not None:
+                values["max_iterations"] = max_iterations
             self._write(values)
         return self.public()
 

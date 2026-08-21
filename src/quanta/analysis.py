@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import random
 import re
@@ -10,6 +11,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any, Literal, TypedDict, TypeVar
 
+from langchain_core.callbacks import get_usage_metadata_callback
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -229,7 +231,7 @@ class AnalysisEngine:
             raise RuntimeError("Configure a model API key in Settings to run an AI analysis")
         cells = self.store.list_cells(session_id)
         context = _cell_context(cells)
-        requests = self.store.list_requests(session_id)
+        requests = self.store.list_requests(session_id, limit=_MAX_HISTORY_REQUESTS)
         if requests and requests[-1]["content"] == state.get("user_request"):
             requests = requests[:-1]
         history = "\n".join(f"- {item['content']}" for item in requests)
@@ -348,6 +350,41 @@ class AnalysisEngine:
             cell = self.notebook.create_cell(session_id, "code", source)
         return {"decision": {**decision, "target_cell_id": cell["id"]}, "unchanged_generations": 0}
 
+    def regenerate_cell(self, session_id: str, cell_id: str) -> dict[str, Any]:
+        """Rewrite one existing code cell directly, without a full decide/generate/execute loop.
+
+        Used by the manual "Regenerate" action in the UI: the user already
+        knows which cell they want rewritten, so this skips straight to code
+        generation instead of asking the model to choose an action first.
+        """
+        self._check_cancelled(session_id)
+        cells = self.store.list_cells(session_id)
+        target = next((cell for cell in cells if cell["id"] == cell_id), None)
+        if target is None or target["kind"] != "code":
+            raise ValueError("Only code cells in this session can be regenerated")
+        session = self.store.get_session(session_id)
+        manifest = session["manifest"] or {}
+        successful_cells = _successful_code_context([cell for cell in cells if cell["id"] != cell_id])
+        latest_execution = target["executions"][-1] if target["executions"] else {}
+        prompt = _code_generation_prompt(
+            instruction=(
+                "Regenerate this cell. Keep the same intent and outputs, but improve "
+                "robustness, clarity, or correctness."
+            ),
+            manifest=manifest,
+            columns=column_brief(manifest),
+            target=target,
+            recent_result=latest_execution,
+            installed=_installed_packages_brief(self.packages),
+            successful_cells=successful_cells,
+        )
+        source = _strip_code_fence(
+            self._stream_model(session_id, "code", prompt, system=_CODE_SYSTEM, action="edit", target_cell_id=cell_id)
+        )
+        if not source:
+            raise RuntimeError("The model returned an empty code cell.")
+        return self.notebook.revise_cell(session_id, cell_id, source, "assistant")
+
     def _route_after_generate(self, state: AnalysisState) -> str:
         return "execute" if state["decision"].get("target_cell_id") else "decide"
 
@@ -462,7 +499,7 @@ class AnalysisEngine:
         return {"completion_message": state.get("decision", {}).get("instruction", "Analysis complete")}
 
     def _route_after_step(self, state: AnalysisState) -> str:
-        return "finish" if state.get("iterations", 0) >= self.config.max_iterations else "decide"
+        return "finish" if state.get("iterations", 0) >= self.settings.max_iterations() else "decide"
 
     def _stream_model(
         self,
@@ -501,27 +538,29 @@ class AnalysisEngine:
             chunks: list[str] = []
             streaming = False
             try:
-                for chunk in model.stream(messages):
-                    self._check_cancelled(session_id)
-                    text = chunk.text
-                    if text:
-                        if not streaming:
-                            streaming = True
-                            self.events.emit(
-                                session_id,
-                                "status",
-                                status="running",
-                                phase="model_streaming",
-                                message=f"Streaming {kind}",
-                            )
-                        chunks.append(text)
-                        self.events.emit(session_id, "draft_delta", draft_id=draft_id, kind=kind, delta=text)
+                with get_usage_metadata_callback() as usage:
+                    for chunk in model.stream(messages):
+                        self._check_cancelled(session_id)
+                        text = chunk.text
+                        if text:
+                            if not streaming:
+                                streaming = True
+                                self.events.emit(
+                                    session_id,
+                                    "status",
+                                    status="running",
+                                    phase="model_streaming",
+                                    message=f"Streaming {kind}",
+                                )
+                            chunks.append(text)
+                            self.events.emit(session_id, "draft_delta", draft_id=draft_id, kind=kind, delta=text)
             except Exception as exc:
                 self.events.emit(session_id, "draft_discarded", draft_id=draft_id, kind=kind)
                 if attempt >= attempts or not _is_retryable_model_error(exc):
                     raise
                 self._retry_model(session_id, exc, attempt)
                 continue
+            self._record_usage(session_id, usage.usage_metadata)
             self.events.emit(session_id, "draft_finished", draft_id=draft_id, kind=kind)
             return "".join(chunks).strip()
         raise RuntimeError("Model generation failed")
@@ -537,12 +576,31 @@ class AnalysisEngine:
                 message=message,
             )
             try:
-                return operation()
+                with get_usage_metadata_callback() as usage:
+                    result = operation()
             except Exception as exc:
                 if attempt >= attempts or not _is_retryable_model_error(exc):
                     raise
                 self._retry_model(session_id, exc, attempt)
+                continue
+            self._record_usage(session_id, usage.usage_metadata)
+            return result
         raise RuntimeError("Model request failed")
+
+    def _record_usage(self, session_id: str, usage_by_model: dict[str, Any]) -> None:
+        prompt_tokens = sum(usage.get("input_tokens", 0) for usage in usage_by_model.values())
+        completion_tokens = sum(usage.get("output_tokens", 0) for usage in usage_by_model.values())
+        if not prompt_tokens and not completion_tokens:
+            return
+        totals = self.store.record_usage(session_id, prompt_tokens, completion_tokens)
+        self.events.emit(
+            session_id,
+            "usage",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_prompt_tokens=totals["prompt_tokens"],
+            total_completion_tokens=totals["completion_tokens"],
+        )
 
     def _retry_model(self, session_id: str, exc: Exception, attempt: int) -> None:
         retry_after = _retry_after(exc)
@@ -580,6 +638,8 @@ class AnalysisEngine:
                     temperature=0,
                     timeout=self.config.model_timeout,
                     max_retries=0,
+                    max_completion_tokens=self.config.model_max_output_tokens,
+                    stream_usage=True,
                 )
                 self._model_signature = signature
             return self._model_instance
@@ -731,13 +791,42 @@ def _fallback_brief(manifest: dict[str, Any]) -> tuple[str, list[str]]:
     ]
 
 
+_MAX_HISTORY_REQUESTS = 10
+_DECIDE_OUTPUT_LIMIT = 2000
+
+
+def _truncate_execution_for_prompt(execution: dict[str, Any], limit: int) -> str:
+    """Serialize an execution result for a prompt, keeping tracebacks intact.
+
+    A blind head-slice of the whole JSON blob can separate the exception
+    message from the rest of a long traceback, or cut it out entirely. Trim
+    any error message to its own tail first — where the actual exception
+    type/text lives — then keep the tail of the overall serialized result so
+    a long non-error payload (stdout, a big table) doesn't push the
+    informative part out of budget either.
+    """
+    outputs = execution.get("outputs")
+    if isinstance(outputs, list):
+        trimmed_outputs = []
+        for output in outputs:
+            if isinstance(output, dict) and output.get("type") == "error":
+                message = str(output.get("message", ""))
+                if len(message) > limit:
+                    message = message[-limit:]
+                output = {**output, "message": message}
+            trimmed_outputs.append(output)
+        execution = {**execution, "outputs": trimmed_outputs}
+    serialized = json.dumps(execution, default=str)
+    return serialized[-limit:] if len(serialized) > limit else serialized
+
+
 def _cell_context(cells: list[dict[str, Any]]) -> str:
     if not cells:
         return "No cells yet. Begin with loading the relevant files and inspecting their structure."
     blocks = []
     for cell in cells[-12:]:
         execution = cell["executions"][-1] if cell["executions"] else None
-        output = json.dumps(execution, default=str)[:6000] if execution else "not executed"
+        output = _truncate_execution_for_prompt(execution, _DECIDE_OUTPUT_LIMIT) if execution else "not executed"
         blocks.append(
             f"Cell {cell['id']} ({cell['kind']}, revision {cell['revision']}):\n"
             f"{cell['source'][:6000]}\nOutput: {output}"
@@ -756,8 +845,58 @@ def _installed_packages_brief(packages: PackageManager) -> str:
     return ", ".join(names)
 
 
-def _successful_code_context(cells: list[dict[str, Any]]) -> str:
-    """Render active code revisions whose latest execution succeeded, in execution order."""
+_RECENT_FULL_CELL_WINDOW = 8
+
+
+def _assign_target_names(target: ast.expr) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: list[str] = []
+        for element in target.elts:
+            names.extend(_assign_target_names(element))
+        return names
+    return []
+
+
+def _cell_signature(source: str) -> str:
+    """Summarize the names a cell binds at top level, without its full source.
+
+    Used for cells outside the recent window in `_successful_code_context`: the
+    model still needs to know these names exist and remain usable in the
+    persistent kernel, but doesn't need to re-read code it already wrote.
+    """
+    try:
+        tree = ast.parse(source, mode="exec")
+    except SyntaxError:
+        return "(unparsable)"
+    names: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.extend(_assign_target_names(target))
+        elif isinstance(node, ast.AnnAssign) and node.target is not None:
+            names.extend(_assign_target_names(node.target))
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            names.append(f"{node.name}()")
+        elif isinstance(node, ast.ClassDef):
+            names.append(node.name)
+        elif isinstance(node, ast.Import | ast.ImportFrom):
+            names.extend(alias.asname or alias.name for alias in node.names)
+    unique = list(dict.fromkeys(names))
+    return ", ".join(unique) if unique else "(no top-level bindings)"
+
+
+def _successful_code_context(cells: list[dict[str, Any]], recent_window: int = _RECENT_FULL_CELL_WINDOW) -> str:
+    """Render active code revisions whose latest execution succeeded, in execution order.
+
+    Only the most recent `recent_window` cells get full source; older ones are
+    reduced to a one-line signature of the names they bind. The selection of
+    which cells qualify is unchanged (still every successful active revision,
+    matching kernel replay) — only the representation of older cells shrinks,
+    since resending every cell's full source on every code-generation call
+    grows the prompt quadratically over a long session.
+    """
     successful: list[tuple[int, dict[str, Any]]] = []
     for cell in cells:
         if cell["kind"] != "code":
@@ -770,10 +909,17 @@ def _successful_code_context(cells: list[dict[str, Any]]) -> str:
         if active_executions and active_executions[-1]["status"] == "ok":
             successful.append((active_executions[-1]["execution_count"], cell))
     successful.sort(key=lambda item: item[0])
-    return "\n\n".join(
-        f"Successful cell {cell['id']} (revision {cell['revision']}):\n{cell['source']}"
-        for _execution_count, cell in successful
-    )
+    cutoff = len(successful) - recent_window
+    blocks = []
+    for index, (_execution_count, cell) in enumerate(successful):
+        if index < cutoff:
+            blocks.append(
+                f"Earlier cell {cell['id']} (revision {cell['revision']}) defined: "
+                f"{_cell_signature(cell['source'])}"
+            )
+        else:
+            blocks.append(f"Successful cell {cell['id']} (revision {cell['revision']}):\n{cell['source']}")
+    return "\n\n".join(blocks)
 
 
 def _markdown_instruction(instruction: str) -> str | None:
@@ -814,7 +960,7 @@ def _code_generation_prompt(
     if target:
         prompt += (
             f"\nExisting failing cell to replace:\n{target['source']}\n"
-            f"\nLatest execution result and traceback:\n{json.dumps(recent_result, default=str)[:12000]}\n"
+            f"\nLatest execution result and traceback:\n{_truncate_execution_for_prompt(recent_result, 12000)}\n"
             "\nThe replacement must fix the execution error and must not reproduce the existing source unchanged.\n"
         )
     prompt += f"\nRequired change (follow this over the existing cell):\n{instruction}\n"

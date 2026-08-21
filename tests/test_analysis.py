@@ -10,10 +10,13 @@ import quanta.analysis as analysis_module
 from quanta.analysis import (
     AnalysisEngine,
     AnalystDecision,
+    _cell_signature,
     _code_generation_prompt,
     _installed_packages_brief,
     _is_retryable_model_error,
     _strip_code_fence,
+    _successful_code_context,
+    _truncate_execution_for_prompt,
 )
 from quanta.config import Config
 from quanta.db import Store
@@ -40,7 +43,9 @@ def make_engine(tmp_path: Path) -> tuple[AnalysisEngine, Store]:
     store = Store(config.database_path)
     store.initialize()
     events = EventSink(store)
-    settings = RuntimeSettings(tmp_path / "settings.json", config.llm_model, config.llm_base_url, config.llm_api_key)
+    settings = RuntimeSettings(
+        tmp_path / "settings.json", config.llm_model, config.llm_base_url, config.llm_api_key, config.max_iterations
+    )
     packages = PackageManager(config.packages_dir)
     engine = AnalysisEngine(config, store, events, object(), settings, packages)  # type: ignore[arg-type]
     return engine, store
@@ -121,6 +126,61 @@ def test_code_prompt_puts_failure_before_required_fix() -> None:
     assert prompt.endswith("Replace seaborn with matplotlib\n")
 
 
+def test_cell_signature_extracts_top_level_bindings() -> None:
+    source = (
+        "import pandas as pd\n"
+        "from sklearn.linear_model import LinearRegression\n\n"
+        "df = pd.read_csv('x.csv')\n\n"
+        "def plot_sales():\n    pass\n"
+    )
+
+    signature = _cell_signature(source)
+
+    assert "pd" in signature
+    assert "LinearRegression" in signature
+    assert "df" in signature
+    assert "plot_sales()" in signature
+
+
+def test_cell_signature_handles_unparsable_source() -> None:
+    assert _cell_signature("def broken(:") == "(unparsable)"
+
+
+def _make_successful_cell(cell_id: str, source: str, execution_count: int) -> dict:
+    return {
+        "id": cell_id,
+        "kind": "code",
+        "revision": 1,
+        "active_revision_id": f"rev-{cell_id}",
+        "source": source,
+        "executions": [{"revision_id": f"rev-{cell_id}", "execution_count": execution_count, "status": "ok"}],
+    }
+
+
+def test_successful_code_context_keeps_full_source_only_within_recent_window() -> None:
+    cells = [
+        _make_successful_cell("old", "old_df = 1", 1),
+        _make_successful_cell("new", "new_df = 2", 2),
+    ]
+
+    context = _successful_code_context(cells, recent_window=1)
+
+    assert "old_df = 1" not in context
+    assert "old_df" in context  # still named in the compact signature
+    assert "Earlier cell old" in context
+    assert "new_df = 2" in context
+
+
+def test_truncate_execution_for_prompt_keeps_traceback_tail() -> None:
+    traceback_text = ("frame " * 200) + "ValueError: the actual problem"
+    execution = {"status": "error", "outputs": [{"type": "error", "message": traceback_text}]}
+
+    result = _truncate_execution_for_prompt(execution, limit=200)
+
+    assert "ValueError: the actual problem" in result
+    assert len(result) <= 200
+
+
 def test_generate_code_receives_every_successful_active_cell(tmp_path: Path, monkeypatch) -> None:
     engine, store = make_engine(tmp_path)
     session = store.create_session("owner/dataset")
@@ -156,6 +216,38 @@ def test_generate_code_receives_every_successful_active_cell(tmp_path: Path, mon
     assert prompt.index(first["source"]) < prompt.index(second["source"])
     assert failed["source"] not in prompt
     assert "Every variable, import, function, and model they defined remains available" in prompt
+
+
+def test_regenerate_cell_rewrites_target_and_excludes_it_from_context(tmp_path: Path, monkeypatch) -> None:
+    engine, store = make_engine(tmp_path)
+    session = store.create_session("owner/dataset")
+    other = store.create_cell(session["id"], "code", "df = pd.read_csv('x.csv')")
+    other_execution = store.start_execution(session["id"], other)
+    store.finish_execution(other_execution["id"], "ok", [])
+    target = store.create_cell(session["id"], "code", "old_broken_code")
+    monkeypatch.setattr(engine, "notebook", _FakeNotebook(store))
+    prompts = []
+
+    def capture_prompt(_session_id, _kind, prompt, **_kwargs):
+        prompts.append(prompt)
+        return "new_code = 1"
+
+    monkeypatch.setattr(engine, "_stream_model", capture_prompt)
+
+    updated = engine.regenerate_cell(session["id"], target["id"])
+
+    assert updated["source"] == "new_code = 1"
+    assert other["source"] in prompts[0]
+    assert "old_broken_code" in prompts[0]  # still shown as the existing cell to replace
+
+
+def test_regenerate_cell_rejects_non_code_cells(tmp_path: Path) -> None:
+    engine, store = make_engine(tmp_path)
+    session = store.create_session("owner/dataset")
+    markdown = store.create_cell(session["id"], "markdown", "Some notes")
+
+    with pytest.raises(ValueError, match="code cells"):
+        engine.regenerate_cell(session["id"], markdown["id"])
 
 
 def test_unchanged_failing_edit_is_not_saved_or_executed(tmp_path: Path, monkeypatch) -> None:
@@ -229,6 +321,29 @@ def test_execute_rejects_markdown_target_without_terminating_run(tmp_path: Path,
     assert [event["type"] for event in store.events_after(session["id"], 0)] == ["note"]
 
 
+def test_record_usage_persists_totals_and_emits_event(tmp_path: Path) -> None:
+    engine, store = make_engine(tmp_path)
+    session = store.create_session("owner/dataset")
+
+    engine._record_usage(session["id"], {"test/model": {"input_tokens": 120, "output_tokens": 30}})
+
+    assert store.get_session(session["id"])["prompt_tokens"] == 120
+    assert store.get_session(session["id"])["completion_tokens"] == 30
+    events = store.events_after(session["id"], 0)
+    assert [event["type"] for event in events] == ["usage"]
+    assert events[0]["payload"]["total_prompt_tokens"] == 120
+
+
+def test_record_usage_is_a_noop_for_empty_usage(tmp_path: Path) -> None:
+    engine, store = make_engine(tmp_path)
+    session = store.create_session("owner/dataset")
+
+    engine._record_usage(session["id"], {})
+
+    assert store.get_session(session["id"])["prompt_tokens"] == 0
+    assert store.events_after(session["id"], 0) == []
+
+
 def test_route_decision_maps_install_action(tmp_path: Path) -> None:
     engine, _store = make_engine(tmp_path)
     assert engine._route_decision({"decision": {"action": "install"}}) == "install"  # type: ignore[arg-type]
@@ -250,6 +365,10 @@ class _FakeNotebook:
     def create_cell(self, session_id: str, kind: str, source: str) -> dict:
         assert self.store is not None
         return self.store.create_cell(session_id, kind, source)
+
+    def revise_cell(self, session_id: str, cell_id: str, source: str, author: str) -> dict:
+        assert self.store is not None
+        return self.store.revise_cell(cell_id, source, author)
 
 
 class _FakeDecisionModel:

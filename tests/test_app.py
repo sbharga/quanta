@@ -161,6 +161,46 @@ def test_get_session_includes_timeline(tmp_path: Path) -> None:
     assert any(entry["type"] == "request" for entry in body["timeline"])
 
 
+def test_regenerate_route_starts_task_and_revises_cell(tmp_path: Path) -> None:
+    app = create_app({"DATA_DIR": tmp_path, "DATABASE_PATH": tmp_path / "app.sqlite3", "LLM_API_KEY": None})
+    app.config.update(TESTING=True)
+    store = app.extensions["quanta"]["store"]
+    session = store.create_session("owner/dataset")
+    cell = store.create_cell(session["id"], "code", "old_code")
+    captured = {}
+
+    def fake_run_manual(session_id, task, message="Executing code"):
+        captured["message"] = message
+        task()
+        return True
+
+    app.extensions["quanta"]["runs"].run_manual = fake_run_manual
+    app.extensions["quanta"]["engine"].regenerate_cell = lambda session_id, cell_id: store.revise_cell(
+        cell_id, "new_code", "assistant"
+    )
+    app.extensions["quanta"]["notebook"].restore_kernel = lambda session_id: None
+    app.extensions["quanta"]["notebook"].run_cell = lambda session_id, cell_id: None
+
+    response = app.test_client().post(f"/api/sessions/{session['id']}/cells/{cell['id']}/regenerate")
+
+    assert response.status_code == 202
+    assert captured["message"] == "Regenerating cell"
+    assert store.get_cell(cell["id"])["source"] == "new_code"
+
+
+def test_regenerate_route_returns_409_when_session_is_busy(tmp_path: Path) -> None:
+    app = create_app({"DATA_DIR": tmp_path, "DATABASE_PATH": tmp_path / "app.sqlite3", "LLM_API_KEY": None})
+    app.config.update(TESTING=True)
+    store = app.extensions["quanta"]["store"]
+    session = store.create_session("owner/dataset")
+    cell = store.create_cell(session["id"], "code", "old_code")
+    app.extensions["quanta"]["runs"].run_manual = lambda *_args, **_kwargs: False
+
+    response = app.test_client().post(f"/api/sessions/{session['id']}/cells/{cell['id']}/regenerate")
+
+    assert response.status_code == 409
+
+
 def test_settings_api_masks_and_persists_tokens(tmp_path: Path) -> None:
     app = create_app(
         {
@@ -190,6 +230,37 @@ def test_settings_api_masks_and_persists_tokens(tmp_path: Path) -> None:
     assert "llm-secret" not in updated.get_data(as_text=True)
     assert "kg-secret" not in client.get("/api/settings").get_data(as_text=True)
     assert (tmp_path / "settings.json").exists()
+
+
+def test_settings_api_updates_and_clears_max_iterations(tmp_path: Path) -> None:
+    app = create_app(
+        {
+            "DATA_DIR": tmp_path,
+            "DATABASE_PATH": tmp_path / "app.sqlite3",
+            "LLM_API_KEY": None,
+            "MAX_ITERATIONS": 12,
+        }
+    )
+    app.config.update(TESTING=True)
+    client = app.test_client()
+
+    updated = client.put("/api/settings", json={"max_iterations": 4})
+    assert updated.status_code == 200
+    assert updated.get_json()["max_iterations"] == 4
+
+    cleared = client.put("/api/settings", json={"max_iterations": None})
+    assert cleared.status_code == 200
+    assert cleared.get_json()["max_iterations"] == 12
+
+
+def test_settings_api_rejects_out_of_range_max_iterations(tmp_path: Path) -> None:
+    app = create_app({"DATA_DIR": tmp_path, "DATABASE_PATH": tmp_path / "app.sqlite3", "LLM_API_KEY": None})
+    app.config.update(TESTING=True)
+    client = app.test_client()
+
+    response = client.put("/api/settings", json={"max_iterations": 0})
+
+    assert response.status_code == 400
 
 
 def test_settings_api_rejects_invalid_base_url(tmp_path: Path) -> None:

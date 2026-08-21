@@ -46,6 +46,7 @@
             <span id="status-dot" class="w-2 h-2 rounded-full bg-faint"></span>
             <span id="status-text">Starting</span>
           </span>
+          <span id="usage-readout" class="hidden text-[10px] text-faint" title="Tokens used by the LLM in this session"></span>
           <button id="data-button" type="button" class="hidden text-[11px] px-2 py-1 border border-line rounded hover:bg-panel-raised text-dim" title="Explore dataset files" aria-controls="dataset-explorer" aria-expanded="false">Data</button>
           <button id="packages-button" type="button" class="text-[11px] px-2 py-1 border border-line rounded hover:bg-panel-raised text-dim" title="Manage Python packages" aria-controls="packages-dialog" aria-expanded="false">Packages</button>
           <a id="download-button" class="text-[11px] px-2 py-1 border border-line rounded hover:bg-panel-raised text-dim" title="Download as .ipynb">.ipynb</a>
@@ -73,6 +74,10 @@
         <div class="max-w-3xl mx-auto">
           <div id="prompt-text" class="hidden mb-2 text-[11.5px] text-dim whitespace-pre-wrap"></div>
           <div id="suggestions" class="hidden flex flex-wrap gap-2 mb-2"></div>
+          <div id="queued-followup" class="hidden mb-2 text-[11px] text-dim flex items-center gap-2">
+            <span class="px-2 py-0.5 rounded-full border border-line text-accent">Queued</span>
+            <span id="queued-followup-text" class="truncate"></span>
+          </div>
           <form id="composer-form" class="flex gap-2 items-end">
             <textarea id="composer-input" rows="1"
               class="flex-1 min-w-0 resize-none bg-panel border border-line rounded px-3 py-2 text-[13px] focus:outline-none focus:border-accent placeholder:text-faint"
@@ -156,6 +161,10 @@
         <input id="llm-base-url" type="text" placeholder="https://openrouter.ai/api/v1"
           class="w-full bg-bg border border-line rounded px-2.5 py-1.5 text-[12px] focus:outline-none focus:border-accent">
         <p class="mt-2 text-[10px] text-faint leading-relaxed">Any OpenAI-compatible endpoint works — OpenRouter (default), OpenAI, a local Ollama/LM Studio/vLLM server, Groq, Together, and so on.</p>
+        <label for="max-iterations" class="block text-[11px] font-semibold mt-3 mb-1.5">Max agent steps per run</label>
+        <input id="max-iterations" type="number" min="1" max="100" step="1" placeholder="12"
+          class="w-full bg-bg border border-line rounded px-2.5 py-1.5 text-[12px] focus:outline-none focus:border-accent">
+        <p class="mt-2 text-[10px] text-faint leading-relaxed">Caps how many decide/generate/execute iterations one analysis run can take, as a direct cost ceiling. Leave blank to use the default.</p>
       </div>
 
       <div class="border border-line rounded-lg p-4 mt-3 bg-panel-raised">
