@@ -425,19 +425,73 @@ def test_install_route_starts_task_and_records_installed_package(tmp_path: Path)
     assert "package_install_finished" in events
 
 
-def test_uninstall_route_returns_409_when_session_is_busy(tmp_path: Path) -> None:
-    app = create_app(
-        {
-            "DATA_DIR": tmp_path,
-            "DATABASE_PATH": tmp_path / "app.sqlite3",
-            "LLM_API_KEY": None,
-        }
-    )
+def test_rename_session_rejects_non_string_title(tmp_path: Path) -> None:
+    app = create_app({"DATA_DIR": tmp_path, "DATABASE_PATH": tmp_path / "app.sqlite3", "LLM_API_KEY": None})
     app.config.update(TESTING=True)
     store = app.extensions["quanta"]["store"]
     session = store.create_session("owner/dataset")
-    app.extensions["quanta"]["runs"].run_manual = lambda *_args, **_kwargs: False
+
+    res_none = app.test_client().patch(f"/api/sessions/{session['id']}", json={"title": None})
+    assert res_none.status_code == 400
+
+    res_int = app.test_client().patch(f"/api/sessions/{session['id']}", json={"title": 12345})
+    assert res_int.status_code == 400
+
+
+def test_delete_session_removes_session_directory(tmp_path: Path) -> None:
+    app = create_app({"DATA_DIR": tmp_path, "DATABASE_PATH": tmp_path / "app.sqlite3", "LLM_API_KEY": None})
+    app.config.update(TESTING=True)
+    store = app.extensions["quanta"]["store"]
+    session = store.create_session("owner/dataset")
+    session_dir = tmp_path / "sessions" / session["id"]
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "test.txt").write_text("data", encoding="utf-8")
+
+    response = app.test_client().delete(f"/api/sessions/{session['id']}")
+    assert response.status_code == 200
+    assert not session_dir.exists()
+
+
+def test_install_route_emits_error_on_unexpected_exception(tmp_path: Path) -> None:
+    app = create_app({"DATA_DIR": tmp_path, "DATABASE_PATH": tmp_path / "app.sqlite3", "LLM_API_KEY": None})
+    app.config.update(TESTING=True)
+    store = app.extensions["quanta"]["store"]
+    session = store.create_session("owner/dataset")
+
+    def fake_install(specs, progress):
+        raise RuntimeError("Unexpected pip crash")
+
+    app.extensions["quanta"]["packages"].install = fake_install
+    app.extensions["quanta"]["runs"].run_manual = lambda session_id, task, **kwargs: task() or True
+
+    response = app.test_client().post(f"/api/sessions/{session['id']}/packages", json={"specs": ["seaborn"]})
+    assert response.status_code == 202
+
+    events = [record for record in store.events_after(session["id"], 0) if record["type"] == "package_install_finished"]
+    assert len(events) == 1
+    assert events[0]["payload"]["status"] == "error"
+    assert "Unexpected pip crash" in events[0]["payload"]["message"]
+
+
+def test_uninstall_route_removes_package_and_marks_stale(tmp_path: Path) -> None:
+    app = create_app({"DATA_DIR": tmp_path, "DATABASE_PATH": tmp_path / "app.sqlite3", "LLM_API_KEY": None})
+    app.config.update(TESTING=True)
+    store = app.extensions["quanta"]["store"]
+    session = store.create_session("owner/dataset")
+    store.record_package("seaborn", "seaborn==0.13.2", "0.13.2", "user", session["id"])
+
+    app.extensions["quanta"]["packages"].uninstall = lambda name, progress: {
+        "status": "ok",
+        "packages": [],
+        "log": "Uninstalled 1 package",
+    }
+    app.extensions["quanta"]["runs"].run_manual = lambda session_id, task, **kwargs: task() or True
 
     response = app.test_client().delete(f"/api/sessions/{session['id']}/packages/seaborn")
+    assert response.status_code == 202
 
-    assert response.status_code == 409
+    assert store.list_packages() == []
+    events = [record for record in store.events_after(session["id"], 0) if record["type"] == "package_install_finished"]
+    assert len(events) == 1
+    assert events[0]["payload"]["status"] == "ok"
+

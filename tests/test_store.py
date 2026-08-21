@@ -199,3 +199,38 @@ def test_forget_package_removes_row(tmp_path: Path) -> None:
     store.forget_package("seaborn")
 
     assert store.list_packages() == []
+
+
+def test_revise_cell_raises_key_error_for_nonexistent_cell(tmp_path: Path) -> None:
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    try:
+        store.revise_cell("nonexistent-cell-id", "x = 1", "user")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("expected KeyError")
+
+
+def test_session_exists(tmp_path: Path) -> None:
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    session = store.create_session("owner/dataset")
+    assert store.session_exists(session["id"]) is True
+    assert store.session_exists("nonexistent-session") is False
+
+
+def test_connect_rolls_back_on_error(tmp_path: Path) -> None:
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    session = store.create_session("owner/dataset")
+
+    try:
+        with store.connect() as db:
+            db.execute("UPDATE sessions SET title = 'Failed Update' WHERE id = ?", (session["id"],))
+            raise RuntimeError("something went wrong")
+    except RuntimeError:
+        pass
+
+    assert store.get_session(session["id"])["title"] is None
+

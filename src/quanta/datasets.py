@@ -219,8 +219,8 @@ def _inspect_table(path: Path) -> dict[str, Any]:
             {
                 "name": str(column),
                 "dtype": str(frame[column].dtype),
-                "nulls_in_sample": int(frame[column].isna().sum()),
-                "unique_in_sample": int(frame[column].nunique(dropna=True)),
+                "nulls_in_sample": _safe_null_count(frame[column]),
+                "unique_in_sample": _safe_nunique(frame[column]),
             }
             for column in frame.columns
         ],
@@ -395,10 +395,31 @@ def _count_lines(path: Path) -> int:
         return sum(1 for _ in handle)
 
 
+def _safe_null_count(series: pd.Series) -> int:
+    try:
+        return int(series.isna().sum())
+    except Exception:
+        return 0
+
+
+def _safe_nunique(series: pd.Series) -> int | None:
+    try:
+        return int(series.nunique(dropna=True))
+    except TypeError:
+        try:
+            return int(series.astype(str).nunique(dropna=True))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
 def _count_csv_records(path: Path, separator: str) -> int:
     if path.stat().st_size > 100 * 1024**2:
         with path.open("rb") as handle:
             sample = handle.read(1024**2)
+        if not sample:
+            return 0
         sample_lines = max(1, sample.count(b"\n"))
         return max(0, round(path.stat().st_size / len(sample) * sample_lines) - 1)
     with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
