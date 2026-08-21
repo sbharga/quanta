@@ -35,9 +35,10 @@ class KernelManager:
         work_dir: Path,
         artifact_dir: Path,
         on_output: Callable[[dict[str, Any]], None],
+        capture_artifacts: bool = True,
     ) -> tuple[str, list[dict[str, Any]]]:
         worker = self._get_worker(session_id, work_dir, artifact_dir)
-        return worker.execute(source, on_output, self.timeout, self.max_output_chars)
+        return worker.execute(source, on_output, self.timeout, self.max_output_chars, capture_artifacts)
 
     def stop(self, session_id: str) -> None:
         with self._lock:
@@ -100,10 +101,12 @@ class KernelProcess:
         on_output: Callable[[dict[str, Any]], None],
         timeout: int,
         max_output_chars: int,
+        capture_artifacts: bool = True,
     ) -> tuple[str, list[dict[str, Any]]]:
         request_id = str(uuid.uuid4())
         outputs: list[dict[str, Any]] = []
         output_chars = 0
+        truncated = False
         with self.lock:
             if self._stale:
                 # A package was installed/uninstalled since this worker started;
@@ -112,7 +115,9 @@ class KernelProcess:
                 # any stray reply (the worker doesn't send one).
                 self.commands.put({"type": "refresh"})
                 self._stale = False
-            self.commands.put({"type": "execute", "id": request_id, "source": source})
+            self.commands.put(
+                {"type": "execute", "id": request_id, "source": source, "capture_artifacts": capture_artifacts}
+            )
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 try:
@@ -132,6 +137,11 @@ class KernelProcess:
                 if payload["type"] in {"stdout", "stderr"}:
                     remaining = max_output_chars - output_chars
                     if remaining <= 0:
+                        if not truncated:
+                            truncated = True
+                            notice = {"type": payload["type"], "text": "\n…[output truncated]"}
+                            outputs.append(notice)
+                            on_output(notice)
                         continue
                     payload["text"] = payload["text"][:remaining]
                     output_chars += len(payload["text"])
@@ -207,6 +217,7 @@ def _worker_main(commands: Any, results: Any, work_dir: str, artifact_dir: str, 
             importlib.invalidate_caches()
             continue
         request_id = command["id"]
+        capture_artifacts = command.get("capture_artifacts", True)
         stdout = _QueueStream(results, request_id, "stdout")
         stderr = _QueueStream(results, request_id, "stderr")
         status = "ok"
@@ -217,12 +228,13 @@ def _worker_main(commands: Any, results: Any, work_dir: str, artifact_dir: str, 
                 value = _execute_source(command["source"], namespace)
                 if value is not None:
                     results.put({"id": request_id, **_serialize_value(value)})
-                for figure_number in plt.get_fignums():
-                    figure = plt.figure(figure_number)
-                    filename = f"plot-{uuid.uuid4().hex}.png"
-                    target = Path(artifact_dir) / filename
-                    figure.savefig(target, dpi=140, bbox_inches="tight")
-                    results.put({"id": request_id, "type": "image", "path": filename, "alt": "Generated plot"})
+                if capture_artifacts:
+                    for figure_number in plt.get_fignums():
+                        figure = plt.figure(figure_number)
+                        filename = f"plot-{uuid.uuid4().hex}.png"
+                        target = Path(artifact_dir) / filename
+                        figure.savefig(target, dpi=140, bbox_inches="tight")
+                        results.put({"id": request_id, "type": "image", "path": filename, "alt": "Generated plot"})
                 plt.close("all")
         except BaseException:  # The traceback is the notebook output.
             status = "error"

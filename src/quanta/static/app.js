@@ -10,6 +10,7 @@ const state = {
   packages: [],
   pinned: true,
   submitting: false,
+  queuedFollowup: null,
   toastTimer: null,
 };
 
@@ -132,6 +133,7 @@ function renderSettings(settings) {
   $("#key-warning").classList.toggle("hidden", settings.llm_configured);
   $("#llm-model").value = settings.llm_model;
   $("#llm-base-url").value = settings.llm_base_url;
+  $("#max-iterations").value = settings.max_iterations;
   setCredentialStatus("#llm-status", settings.llm_configured, settings.llm_source);
   setCredentialStatus("#kaggle-status", settings.kaggle_configured, settings.kaggle_source);
 }
@@ -165,6 +167,8 @@ async function saveSettings(event) {
     llm_model: $("#llm-model").value.trim(),
     llm_base_url: $("#llm-base-url").value.trim(),
   };
+  const maxIterationsRaw = $("#max-iterations").value.trim();
+  body.max_iterations = maxIterationsRaw ? Number(maxIterationsRaw) : null;
   const llmKey = $("#llm-key").value.trim();
   const kaggleToken = $("#kaggle-token").value.trim();
   if (llmKey || $("#clear-llm").checked) {
@@ -447,6 +451,7 @@ async function openSession(sessionId) {
   state.pendingPrompt = null;
   state.selectedDatasetPath = null;
   state.submitting = false;
+  state.queuedFollowup = null;
   state.pinned = true;
   $("#dataset-file-filter").value = "";
   $("#composer-input").value = "";
@@ -502,6 +507,7 @@ function closeSession() {
   state.pendingPrompt = null;
   state.selectedDatasetPath = null;
   state.submitting = false;
+  state.queuedFollowup = null;
   localStorage.removeItem("quanta-session");
   $("#timeline").replaceChildren();
   $("#timeline-host").classList.add("hidden");
@@ -691,6 +697,22 @@ function renderSessionHeader(session) {
   $("#header-dataset").textContent = session.dataset_ref;
   $("#download-button").href = `/api/sessions/${session.id}/notebook.ipynb`;
   applySessionStatus(session.status, session.error || session.status, session.running);
+  renderUsage(session.prompt_tokens || 0, session.completion_tokens || 0);
+}
+
+function formatTokenCount(count) {
+  if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+  return String(count);
+}
+
+function renderUsage(promptTokens, completionTokens) {
+  const readout = $("#usage-readout");
+  if (!promptTokens && !completionTokens) {
+    readout.classList.add("hidden");
+    return;
+  }
+  readout.textContent = `${formatTokenCount(promptTokens)} in · ${formatTokenCount(completionTokens)} out`;
+  readout.classList.remove("hidden");
 }
 
 function setStatus(status, message) {
@@ -787,12 +809,29 @@ function renderSuggestions(suggestions) {
   });
 }
 
+function isSessionMidRun(session) {
+  return Boolean(session) && (session.running || ["running", "downloading", "inspecting", "cancelling"].includes(session.status));
+}
+
 async function submitComposer(event) {
   event.preventDefault();
   const input = $("#composer-input");
-  const custom = input.value.trim();
-  const content = custom;
+  const content = input.value.trim();
   if (!content) return toast("Choose a suggestion or enter a request.");
+  if (isSessionMidRun(state.session)) {
+    // The agent is still working through a prior request — queue this one
+    // instead of blocking the composer, and send it once the run settles.
+    state.queuedFollowup = content;
+    input.value = "";
+    resizeComposerInput();
+    updateComposerAvailability();
+    return;
+  }
+  await sendComposerContent(content);
+}
+
+async function sendComposerContent(content) {
+  const input = $("#composer-input");
   state.submitting = true;
   updateComposerAvailability();
   try {
@@ -813,14 +852,27 @@ async function submitComposer(event) {
   applySessionStatus("running", "Starting the next analysis step", true);
 }
 
+function trySendQueuedFollowup() {
+  if (!state.queuedFollowup) return;
+  const content = state.queuedFollowup;
+  state.queuedFollowup = null;
+  updateComposerAvailability();
+  sendComposerContent(content);
+}
+
 function updateComposerAvailability() {
   const session = state.session;
   if (!session) return;
-  const busy = state.submitting || session.running || ["running", "downloading", "inspecting", "cancelling"].includes(session.status);
+  const midRun = isSessionMidRun(session);
   const submit = $("#composer-form").querySelector("button[type='submit']");
-  submit.disabled = busy;
-  submit.classList.toggle("opacity-40", busy);
-  $("#composer-input").disabled = busy;
+  const input = $("#composer-input");
+  const locked = state.submitting || (midRun && Boolean(state.queuedFollowup));
+  submit.disabled = locked;
+  submit.classList.toggle("opacity-40", locked);
+  input.disabled = locked;
+  submit.textContent = midRun ? "Queue" : "Send";
+  $("#queued-followup").classList.toggle("hidden", !state.queuedFollowup);
+  if (state.queuedFollowup) $("#queued-followup-text").textContent = state.queuedFollowup;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -834,6 +886,7 @@ const KNOWN_EVENTS = [
   "execution_started", "execution_output", "execution_finished",
   "draft_started", "draft_delta", "draft_finished", "draft_discarded", "model_retry",
   "package_install_started", "package_install_output", "package_install_finished",
+  "usage",
   "error", "complete", "question",
 ];
 
@@ -927,6 +980,13 @@ function applyEvent(type, data) {
     case "model_retry":
       applySessionStatus("running", data.message || `Retrying model request in ${data.delay}s`, true);
       break;
+    case "usage":
+      if (state.session) {
+        state.session.prompt_tokens = data.total_prompt_tokens;
+        state.session.completion_tokens = data.total_completion_tokens;
+      }
+      renderUsage(data.total_prompt_tokens, data.total_completion_tokens);
+      break;
     case "package_install_started":
       applySessionStatus("running", `Installing ${(data.specs || []).join(", ")}`, true);
       applyTimelineEntry({type: "note", event: "package_install_started", specs: data.specs});
@@ -948,18 +1008,28 @@ function applyEvent(type, data) {
       applyTimelineEntry({type: "error", message: data.message});
       state.submitting = false;
       applySessionStatus("error", data.message, false);
+      if (state.queuedFollowup) {
+        // Don't fire a queued message blindly into an error state — hand the
+        // text back to the composer so the user can review and resend it.
+        $("#composer-input").value = state.queuedFollowup;
+        state.queuedFollowup = null;
+        resizeComposerInput();
+        updateComposerAvailability();
+      }
       break;
     case "complete":
       clearPendingDraft();
       applyTimelineEntry({type: "complete", message: data.message});
       state.submitting = false;
       applySessionStatus("complete", data.message || "Analysis complete", false);
+      trySendQueuedFollowup();
       break;
     case "question":
       clearPendingDraft();
       state.submitting = false;
       applySessionStatus("waiting", "Waiting for your response", false);
       showQuestion(data.prompt);
+      trySendQueuedFollowup();
       break;
     default:
       break;
@@ -1082,10 +1152,15 @@ function buildCellNode(cell) {
   editButton.type = "button";
   actions.append(editButton);
   let runButton = null;
+  let regenerateButton = null;
   if (cell.kind === "code") {
     runButton = el("button", "px-1.5 py-0.5 border border-line rounded hover:bg-panel-raised normal-case tracking-normal", "Run");
     runButton.type = "button";
     actions.append(runButton);
+    regenerateButton = el("button", "px-1.5 py-0.5 border border-line rounded hover:bg-panel-raised normal-case tracking-normal", "Regenerate");
+    regenerateButton.type = "button";
+    regenerateButton.title = "Ask the model to rewrite this cell";
+    actions.append(regenerateButton);
   }
   toolbar.append(labelWrap, runStatus, actions);
 
@@ -1102,6 +1177,7 @@ function buildCellNode(cell) {
 
   editButton.addEventListener("click", () => beginEditCell(refs));
   if (runButton) runButton.addEventListener("click", () => runCell(cell.id));
+  if (regenerateButton) regenerateButton.addEventListener("click", () => regenerateCell(cell.id));
 
   return article;
 }
@@ -1158,6 +1234,14 @@ function beginEditCell(refs) {
       toast(error.message);
     }
   });
+}
+
+async function regenerateCell(cellId) {
+  try {
+    await api(`/api/sessions/${state.sessionId}/cells/${cellId}/regenerate`, {method: "POST", body: "{}"});
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 async function runCell(cellId) {
@@ -1250,6 +1334,11 @@ function buildOutputNode(output) {
     table.append(thead, tbody);
     scroll.appendChild(table);
     wrapper.appendChild(scroll);
+    if (output.truncated) {
+      wrapper.appendChild(
+        el("p", "mt-1.5 text-[10px] text-faint", `Showing ${output.rows.length} of ${output.total_rows.toLocaleString()} rows`)
+      );
+    }
   }
   return wrapper;
 }

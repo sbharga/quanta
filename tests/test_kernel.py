@@ -46,6 +46,45 @@ def test_kernel_returns_traceback(tmp_path: Path) -> None:
     assert "ValueError: bad value" in outputs[-1]["message"]
 
 
+def test_output_truncation_adds_a_single_marker(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    artifacts = tmp_path / "artifacts"
+    data.mkdir()
+    manager = KernelManager(timeout=15, max_output_chars=20)
+    try:
+        status, outputs = manager.execute(
+            "session", "for _ in range(50): print('x' * 20)", data, artifacts, lambda _: None
+        )
+    finally:
+        manager.close()
+
+    assert status == "ok"
+    markers = [output for output in outputs if "truncated" in output.get("text", "")]
+    assert len(markers) == 1
+
+
+def test_capture_artifacts_false_skips_plot_files(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    artifacts = tmp_path / "artifacts"
+    data.mkdir()
+    manager = KernelManager(timeout=15)
+    try:
+        status, outputs = manager.execute(
+            "session",
+            "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3])",
+            data,
+            artifacts,
+            lambda _: None,
+            capture_artifacts=False,
+        )
+    finally:
+        manager.close()
+
+    assert status == "ok"
+    assert not any(output.get("type") == "image" for output in outputs)
+    assert not artifacts.exists() or not list(artifacts.iterdir())
+
+
 def test_worker_imports_from_packages_dir_after_app_site_packages(tmp_path: Path) -> None:
     data = tmp_path / "data"
     artifacts = tmp_path / "artifacts"

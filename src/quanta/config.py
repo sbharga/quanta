@@ -19,6 +19,7 @@ class Config:
     max_output_chars: int
     model_timeout: float
     model_max_retries: int
+    model_max_output_tokens: int = 4096
 
     @classmethod
     def from_env(cls, instance_path: str | Path) -> Config:
@@ -39,6 +40,7 @@ class Config:
             max_output_chars=int(os.environ.get("QUANTA_MAX_OUTPUT_CHARS", "200000")),
             model_timeout=float(os.environ.get("QUANTA_MODEL_TIMEOUT", "60")),
             model_max_retries=int(os.environ.get("QUANTA_MODEL_MAX_RETRIES", "3")),
+            model_max_output_tokens=int(os.environ.get("QUANTA_MODEL_MAX_OUTPUT_TOKENS", "4096")),
         )
 
     def session_dir(self, session_id: str) -> Path:

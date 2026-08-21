@@ -48,6 +48,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             max_output_chars=test_config.get("MAX_OUTPUT_CHARS", config.max_output_chars),
             model_timeout=test_config.get("MODEL_TIMEOUT", config.model_timeout),
             model_max_retries=test_config.get("MODEL_MAX_RETRIES", config.model_max_retries),
+            model_max_output_tokens=test_config.get("MODEL_MAX_OUTPUT_TOKENS", config.model_max_output_tokens),
         )
         config.data_dir.mkdir(parents=True, exist_ok=True)
         config.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,6 +63,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         config.llm_model,
         config.llm_base_url,
         config.llm_api_key,
+        config.max_iterations,
     )
     packages = PackageManager(config.packages_dir)
     kernels = KernelManager(config.execution_timeout, config.max_output_chars, config.packages_dir)
@@ -92,21 +94,36 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.put("/api/settings")
     def update_settings() -> tuple[Response, int] | Response:
         body = request.get_json(silent=True) or {}
-        allowed = {"llm_api_key", "kaggle_api_token", "llm_model", "llm_base_url"}
+        allowed = {"llm_api_key", "kaggle_api_token", "llm_model", "llm_base_url", "max_iterations"}
         unknown = set(body) - allowed
         if unknown:
             return jsonify({"error": f"Unsupported settings: {', '.join(sorted(unknown))}"}), 400
-        invalid = [key for key, value in body.items() if value is not None and not isinstance(value, str)]
+        string_keys = {"llm_api_key", "kaggle_api_token", "llm_model", "llm_base_url"}
+        invalid = [
+            key for key in string_keys if key in body and body[key] is not None and not isinstance(body[key], str)
+        ]
         if invalid:
             return jsonify({"error": f"Settings must be strings: {', '.join(sorted(invalid))}"}), 400
         base_url = body.get("llm_base_url")
         if base_url is not None and base_url.strip() and not base_url.strip().startswith(("http://", "https://")):
             return jsonify({"error": "Base URL must start with http:// or https://"}), 400
+        clear_max_iterations = False
+        max_iterations = None
+        if "max_iterations" in body:
+            raw = body["max_iterations"]
+            if raw is None or raw == "":
+                clear_max_iterations = True
+            elif not isinstance(raw, int) or isinstance(raw, bool) or not (1 <= raw <= 100):
+                return jsonify({"error": "max_iterations must be an integer between 1 and 100"}), 400
+            else:
+                max_iterations = raw
         updated = settings.update(
             llm_api_key=body.get("llm_api_key") if "llm_api_key" in body else None,
             kaggle_api_token=body.get("kaggle_api_token") if "kaggle_api_token" in body else None,
             llm_model=body.get("llm_model") if "llm_model" in body else None,
             llm_base_url=base_url if "llm_base_url" in body else None,
+            max_iterations=max_iterations,
+            clear_max_iterations=clear_max_iterations,
         )
         return jsonify(updated)
 
@@ -137,9 +154,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             session = store.get_session(session_id)
         except KeyError:
             abort(404)
-        session["cells"] = store.list_cells(session_id)
+        cells = store.list_cells(session_id)
+        session["cells"] = cells
         session["running"] = runs.is_running(session_id)
-        timeline = notebook.build_timeline(session_id)
+        timeline = notebook.build_timeline(session_id, cells=cells)
         session["timeline"] = timeline["entries"]
         session["event_cursor"] = timeline["event_cursor"]
         session["active_draft"] = timeline["active_draft"]
@@ -238,6 +256,25 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 events.emit(session_id, "error", message=f"{type(exc).__name__}: {exc}")
 
         if not runs.run_manual(session_id, execute):
+            return jsonify({"error": "Wait for the current run to pause or finish"}), 409
+        return jsonify({"started": True}), 202
+
+    @app.post("/api/sessions/<session_id>/cells/<cell_id>/regenerate")
+    def regenerate_cell(session_id: str, cell_id: str) -> tuple[Response, int] | Response:
+        try:
+            store.get_session(session_id)
+        except KeyError:
+            abort(404)
+
+        def regenerate() -> None:
+            try:
+                engine.regenerate_cell(session_id, cell_id)
+                notebook.restore_kernel(session_id)
+                notebook.run_cell(session_id, cell_id)
+            except Exception as exc:
+                events.emit(session_id, "error", message=f"{type(exc).__name__}: {exc}")
+
+        if not runs.run_manual(session_id, regenerate, message="Regenerating cell"):
             return jsonify({"error": "Wait for the current run to pause or finish"}), 409
         return jsonify({"started": True}), 202
 

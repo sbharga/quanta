@@ -15,7 +15,7 @@ class FakeKernels:
     def has_worker(self, _session_id: str) -> bool:
         return False
 
-    def execute(self, _session_id, source, _data, _artifacts, _callback):
+    def execute(self, _session_id, source, _data, _artifacts, _callback, capture_artifacts=True):
         self.sources.append(source)
         return "ok", []
 
@@ -51,6 +51,33 @@ def test_restore_does_not_run_an_untested_revision(tmp_path: Path) -> None:
     notebook.restore_kernel(session["id"])
 
     assert kernels.sources == []
+
+
+def test_restore_kernel_does_not_leak_replayed_plot_artifacts(tmp_path: Path) -> None:
+    from quanta.kernel import KernelManager
+
+    store = Store(tmp_path / "test.sqlite3")
+    store.initialize()
+    config = make_config(tmp_path)
+    session = store.create_session("owner/dataset")
+    (config.session_dir(session["id"]) / "data").mkdir(parents=True)
+    kernels = KernelManager(timeout=15)
+    notebook = NotebookService(config, store, EventSink(store), kernels)
+    cell = notebook.create_cell(session["id"], "code", "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3])")
+    try:
+        notebook.run_cell(session["id"], cell["id"])
+        artifacts_dir = config.session_dir(session["id"]) / "artifacts"
+        assert list(artifacts_dir.iterdir())  # the real run does produce a plot file
+
+        # Simulate an app restart: stop the live worker so restore_kernel replays.
+        kernels.stop(session["id"])
+        before = set(artifacts_dir.iterdir())
+        notebook.restore_kernel(session["id"])
+        after = set(artifacts_dir.iterdir())
+
+        assert after == before
+    finally:
+        kernels.close()
 
 
 def test_export_notebook_covers_every_output_type(tmp_path: Path) -> None:

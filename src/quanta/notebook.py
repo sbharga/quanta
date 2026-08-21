@@ -85,7 +85,9 @@ class NotebookService:
         data_dir = self.config.session_dir(session_id) / "data"
         artifacts = self.config.session_dir(session_id) / "artifacts"
         for index, (_count, cell) in enumerate(successful, 1):
-            status, _ = self.kernels.execute(session_id, cell["source"], data_dir, artifacts, lambda _output: None)
+            status, _ = self.kernels.execute(
+                session_id, cell["source"], data_dir, artifacts, lambda _output: None, capture_artifacts=False
+            )
             self.events.emit(
                 session_id,
                 "kernel_replay_progress",
@@ -98,7 +100,7 @@ class NotebookService:
                 break
         self.events.emit(session_id, "kernel_replay_finished")
 
-    def build_timeline(self, session_id: str) -> dict[str, Any]:
+    def build_timeline(self, session_id: str, cells: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Fold the durable event log into an ordered, replay-safe narrative.
 
         Unlike the old client behaviour of nuking and rebuilding the whole
@@ -108,8 +110,12 @@ class NotebookService:
         tens of thousands of these in a long session) and treats `cell`
         entries as pointers into the current, authoritative cell state from
         `list_cells` rather than replaying every revision.
+
+        `cells` lets a caller that already fetched `store.list_cells` for
+        this session (e.g. the session route, which also returns the raw
+        cell list) pass it in instead of triggering a second identical query.
         """
-        cells = {cell["id"]: _public_cell_full(cell) for cell in self.store.list_cells(session_id)}
+        cell_map = {cell["id"]: _public_cell_full(cell) for cell in cells or self.store.list_cells(session_id)}
         seen_cells: set[str] = set()
         entries: list[dict[str, Any]] = []
         active_draft: dict[str, Any] | None = None
@@ -161,7 +167,7 @@ class NotebookService:
                 break
         for entry in entries:
             if entry["type"] == "cell":
-                cell = cells.get(entry["cell_id"])
+                cell = cell_map.get(entry["cell_id"])
                 if cell:
                     entry["cell"] = cell
         return {"entries": entries, "event_cursor": cursor, "active_draft": active_draft}

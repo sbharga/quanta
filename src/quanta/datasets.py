@@ -24,6 +24,7 @@ DATASET_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 TABULAR_SUFFIXES = {".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".parquet", ".xlsx", ".xls"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 _MANIFEST_CHAR_LIMIT = 60_000
+_COLUMN_BRIEF_CHAR_LIMIT = 20_000
 
 
 def normalize_dataset_ref(value: str) -> str:
@@ -344,13 +345,17 @@ def column_brief(manifest: dict[str, Any]) -> str:
     which is how the model ends up writing df['Artist Type'] and hitting a
     KeyError. repr() plus an explicit marker makes it impossible to miss.
     """
-    lines: list[str] = []
+    header = "Column names (verbatim, index EXACTLY as shown — never guess or strip):\n"
+    budget = _COLUMN_BRIEF_CHAR_LIMIT - len(header)
+    blocks: list[str] = []
+    used = 0
+    omitted_file_count = 0
     for file in manifest.get("files", []):
         inspection = file.get("inspection") or {}
         columns = inspection.get("columns")
         if not columns:
             continue
-        lines.append(f"{file['path']}:")
+        lines = [f"{file['path']}:"]
         for column in columns:
             name = column.get("name", "")
             dtype = column.get("dtype", "")
@@ -361,9 +366,19 @@ def column_brief(manifest: dict[str, Any]) -> str:
                 flags.append("NON-STRING NAME")
             marker = f"  <-- {', '.join(flags)}" if flags else ""
             lines.append(f"  {name!r:40s} {dtype}{marker}")
-    if not lines:
+        block = "\n".join(lines)
+        added_length = len(block) + (1 if blocks else 0)
+        if blocks and used + added_length > budget:
+            omitted_file_count += 1
+            continue
+        blocks.append(block)
+        used += added_length
+    if not blocks:
         return ""
-    return "Column names (verbatim, index EXACTLY as shown — never guess or strip):\n" + "\n".join(lines)
+    text = header + "\n".join(blocks)
+    if omitted_file_count:
+        text += f"\n... ({omitted_file_count} more file(s) with columns omitted for length)"
+    return text
 
 
 def _sniff_separator(path: Path) -> str:
