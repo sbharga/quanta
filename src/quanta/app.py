@@ -25,7 +25,7 @@ from quanta.db import Store
 from quanta.events import EventSink
 from quanta.kernel import KernelManager
 from quanta.notebook import NotebookService
-from quanta.packages import PackageBackendUnavailable, PackageManager, canonical_name, normalize_spec, package_name
+from quanta.packages import PackageManager, canonical_name, normalize_spec, package_name
 from quanta.settings import RuntimeSettings
 
 
@@ -173,9 +173,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         except KeyError:
             abort(404)
         body = request.get_json(silent=True) or {}
-        if "title" not in body:
-            return jsonify({"error": "title is required"}), 400
-        title = str(body["title"]).strip()
+        if "title" not in body or not isinstance(body["title"], str):
+            return jsonify({"error": "title is required and must be a string"}), 400
+        title = body["title"].strip()
         if not title:
             return jsonify({"error": "title cannot be empty"}), 400
         store.update_session(session_id, title=title[:200])
@@ -189,8 +189,11 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             abort(404)
         runs.cancel(session_id)
         kernels.stop(session_id)
+        engine.clear_cancelled(session_id)
         store.delete_session(session_id)
-        shutil.rmtree(config.session_dir(session_id), ignore_errors=True)
+        session_path = config.data_dir / "sessions" / session_id
+        if session_path.exists():
+            shutil.rmtree(session_path, ignore_errors=True)
         return jsonify({"deleted": True})
 
     @app.get("/api/sessions/<session_id>/notebook.ipynb")
@@ -300,7 +303,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             events.emit(session_id, "package_install_started", specs=specs)
             try:
                 result = packages.install(specs, progress)
-            except PackageBackendUnavailable as exc:
+            except Exception as exc:
                 events.emit(session_id, "package_install_finished", status="error", packages=[], message=str(exc))
                 return
             status = result["status"]
@@ -336,18 +339,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             def progress(line: str) -> None:
                 events.emit(session_id, "package_install_output", line=line)
 
-            events.emit(session_id, "package_install_started", specs=[f"uninstall {name}"])
+            spec_name = package_name(name)
+            events.emit(session_id, "package_install_started", specs=[f"uninstall {spec_name}"])
             try:
-                result = packages.uninstall(name, progress)
-            except PackageBackendUnavailable as exc:
+                result = packages.uninstall(spec_name, progress)
+            except Exception as exc:
                 events.emit(session_id, "package_install_finished", status="error", packages=[], message=str(exc))
                 return
             status = result["status"]
             if status == "ok":
-                store.forget_package(canonical_name(package_name(name)))
+                store.forget_package(canonical_name(spec_name))
                 kernels.stop(session_id)
                 kernels.mark_all_stale()
-            message = f"Removed {name}" if status == "ok" else f"Failed to remove {name}"
+            message = f"Removed {spec_name}" if status == "ok" else f"Failed to remove {spec_name}"
             events.emit(
                 session_id, "package_install_finished", status=status, packages=result["packages"], message=message
             )
@@ -396,6 +400,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                         yield f"id: {cursor}\nevent: {record['type']}\ndata: {payload}\n\n"
                     records = store.events_after(session_id, cursor)
                 if time.monotonic() - heartbeat >= 15:
+                    if not store.session_exists(session_id):
+                        break
                     yield ": heartbeat\n\n"
                     heartbeat = time.monotonic()
                 time.sleep(0.25)

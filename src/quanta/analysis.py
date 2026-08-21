@@ -267,7 +267,9 @@ class AnalysisEngine:
         narration = payload["narration"].strip()
         latest_cell = cells[-1] if cells else None
         if narration and (
-            markdown or (latest_cell and latest_cell["kind"] == "code" and latest_cell["executions"])
+            markdown
+            or (latest_cell and latest_cell["kind"] == "code" and latest_cell["executions"])
+            or (payload["action"] == "finish" and (not latest_cell or latest_cell.get("source") != narration))
         ):
             self.notebook.create_cell(session_id, "markdown", narration)
         return {"decision": payload, "iterations": state.get("iterations", 0) + 1}

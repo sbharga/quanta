@@ -121,7 +121,7 @@ class RuntimeSettings:
             return {}
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
-        except OSError, json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):
             return {}
         return value if isinstance(value, dict) else {}
 

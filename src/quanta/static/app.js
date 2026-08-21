@@ -47,6 +47,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#timeline-host").addEventListener("scroll", handleTimelineScroll);
   $("#settings-button").addEventListener("click", openSettings);
   $("#settings-close").addEventListener("click", () => $("#settings-dialog").close());
+  $("#settings-dialog").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) $("#settings-dialog").close();
+  });
   $("#settings-form").addEventListener("submit", saveSettings);
   $("#packages-button").addEventListener("click", openPackages);
   $("#packages-close").addEventListener("click", closePackages);
@@ -1087,6 +1090,8 @@ function noteMessage(entry) {
       return "Kernel state restored";
     case "package_install_started":
       return `Installing ${(entry.specs || []).join(", ")}`;
+    case "package_install_finished":
+      return entry.message || (entry.status === "ok" ? "Packages installed" : "Package installation failed");
     default:
       return entry.message || "";
   }

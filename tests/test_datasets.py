@@ -128,3 +128,28 @@ def test_compact_manifest_is_valid_and_samples_every_directory() -> None:
         "Truck/train",
         "Truck/valid",
     ))
+
+
+def test_inspects_dataset_with_nested_columns(tmp_path: Path) -> None:
+    # Test JSON with nested dicts and Parquet with array columns
+    (tmp_path / "nested.json").write_text(
+        json.dumps([{"id": 1, "meta": {"key": "val"}}, {"id": 2, "meta": {"key": "val2"}}]),
+        encoding="utf-8",
+    )
+    df = pd.DataFrame({"id": [1, 2], "tags": [["a", "b"], ["c"]]})
+    df.to_parquet(tmp_path / "tags.parquet")
+
+    manifest = inspect_dataset(tmp_path)
+
+    assert manifest["file_count"] == 2
+    assert manifest["errors"] == []
+    json_file = next(f for f in manifest["files"] if f["path"] == "nested.json")
+    assert json_file["inspection"]["kind"] == "table"
+    assert json_file["inspection"]["columns"][1]["name"] == "meta"
+    assert json_file["inspection"]["columns"][1]["unique_in_sample"] == 2
+
+    parquet_file = next(f for f in manifest["files"] if f["path"] == "tags.parquet")
+    assert parquet_file["inspection"]["kind"] == "table"
+    assert parquet_file["inspection"]["columns"][1]["name"] == "tags"
+    assert parquet_file["inspection"]["columns"][1]["unique_in_sample"] == 2
+

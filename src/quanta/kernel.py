@@ -159,6 +159,8 @@ class KernelProcess:
         try:
             self.commands.put({"type": "stop"})
             self.process.join(timeout=1)
+        except (ValueError, OSError):
+            pass
         finally:
             if self.process.is_alive():
                 self.process.terminate()
@@ -279,5 +281,5 @@ def _set_resource_limits() -> None:
         import resource
 
         resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
-    except ImportError, OSError, ValueError:
+    except (ImportError, OSError, ValueError):
         pass

@@ -125,6 +125,9 @@ def test_export_notebook_covers_every_output_type(tmp_path: Path) -> None:
     outputs = {o["output_type"] for o in document["cells"][1]["outputs"]}
     assert outputs == {"stream", "execute_result", "display_data", "error"}
 
+    result_output = next(o for o in document["cells"][1]["outputs"] if o["output_type"] == "execute_result")
+    assert result_output["execution_count"] == 1
+
     image_output = next(o for o in document["cells"][1]["outputs"] if o["output_type"] == "display_data")
     assert "image/png" in image_output["data"]
 

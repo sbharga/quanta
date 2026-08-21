@@ -210,7 +210,7 @@ def _export_cell(cell: dict[str, Any], artifacts_dir: Path) -> dict[str, Any]:
     if execution:
         execution_count = execution.get("execution_count")
         for output in execution["outputs"]:
-            exported = _export_output(output, artifacts_dir)
+            exported = _export_output(output, artifacts_dir, execution_count)
             if exported is not None:
                 outputs.append(exported)
     return {
@@ -222,7 +222,9 @@ def _export_cell(cell: dict[str, Any], artifacts_dir: Path) -> dict[str, Any]:
     }
 
 
-def _export_output(output: dict[str, Any], artifacts_dir: Path) -> dict[str, Any] | None:
+def _export_output(
+    output: dict[str, Any], artifacts_dir: Path, execution_count: int | None = None
+) -> dict[str, Any] | None:
     kind = output.get("type")
     if kind in ("stdout", "stderr"):
         return {
@@ -247,14 +249,14 @@ def _export_output(output: dict[str, Any], artifacts_dir: Path) -> dict[str, Any
         text = output.get("text", "")
         return {
             "output_type": "execute_result",
-            "execution_count": None,
+            "execution_count": execution_count,
             "metadata": {},
             "data": {"text/plain": _split_source(text)},
         }
     if kind == "table":
         return {
             "output_type": "execute_result",
-            "execution_count": None,
+            "execution_count": execution_count,
             "metadata": {},
             "data": {
                 "text/plain": _split_source(_table_text(output)),

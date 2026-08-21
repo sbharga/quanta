@@ -27,6 +27,9 @@ class Store:
         try:
             yield connection
             connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -257,15 +260,21 @@ class Store:
             )
         return self.get_cell(cell_id)
 
+    def session_exists(self, session_id: str) -> bool:
+        with self.connect() as db:
+            row = db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        return row is not None
+
     def revise_cell(self, cell_id: str, source: str, author: str) -> dict[str, Any]:
         revision_id = str(uuid.uuid4())
         with self.connect() as db:
+            cell_row = db.execute("SELECT 1 FROM cells WHERE id = ?", (cell_id,)).fetchone()
+            if cell_row is None:
+                raise KeyError(cell_id)
             row = db.execute(
                 "SELECT COALESCE(MAX(revision), 0) + 1 FROM cell_revisions WHERE cell_id = ?",
                 (cell_id,),
             ).fetchone()
-            if row is None:
-                raise KeyError(cell_id)
             revision = row[0]
             db.execute(
                 "INSERT INTO cell_revisions VALUES (?, ?, ?, ?, ?, ?)",
