@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import json
 import random
 import re
@@ -845,58 +844,8 @@ def _installed_packages_brief(packages: PackageManager) -> str:
     return ", ".join(names)
 
 
-_RECENT_FULL_CELL_WINDOW = 8
-
-
-def _assign_target_names(target: ast.expr) -> list[str]:
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names: list[str] = []
-        for element in target.elts:
-            names.extend(_assign_target_names(element))
-        return names
-    return []
-
-
-def _cell_signature(source: str) -> str:
-    """Summarize the names a cell binds at top level, without its full source.
-
-    Used for cells outside the recent window in `_successful_code_context`: the
-    model still needs to know these names exist and remain usable in the
-    persistent kernel, but doesn't need to re-read code it already wrote.
-    """
-    try:
-        tree = ast.parse(source, mode="exec")
-    except SyntaxError:
-        return "(unparsable)"
-    names: list[str] = []
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                names.extend(_assign_target_names(target))
-        elif isinstance(node, ast.AnnAssign) and node.target is not None:
-            names.extend(_assign_target_names(node.target))
-        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            names.append(f"{node.name}()")
-        elif isinstance(node, ast.ClassDef):
-            names.append(node.name)
-        elif isinstance(node, ast.Import | ast.ImportFrom):
-            names.extend(alias.asname or alias.name for alias in node.names)
-    unique = list(dict.fromkeys(names))
-    return ", ".join(unique) if unique else "(no top-level bindings)"
-
-
-def _successful_code_context(cells: list[dict[str, Any]], recent_window: int = _RECENT_FULL_CELL_WINDOW) -> str:
-    """Render active code revisions whose latest execution succeeded, in execution order.
-
-    Only the most recent `recent_window` cells get full source; older ones are
-    reduced to a one-line signature of the names they bind. The selection of
-    which cells qualify is unchanged (still every successful active revision,
-    matching kernel replay) — only the representation of older cells shrinks,
-    since resending every cell's full source on every code-generation call
-    grows the prompt quadratically over a long session.
-    """
+def _successful_code_context(cells: list[dict[str, Any]]) -> str:
+    """Render active code revisions whose latest execution succeeded, in execution order."""
     successful: list[tuple[int, dict[str, Any]]] = []
     for cell in cells:
         if cell["kind"] != "code":
@@ -909,17 +858,10 @@ def _successful_code_context(cells: list[dict[str, Any]], recent_window: int = _
         if active_executions and active_executions[-1]["status"] == "ok":
             successful.append((active_executions[-1]["execution_count"], cell))
     successful.sort(key=lambda item: item[0])
-    cutoff = len(successful) - recent_window
-    blocks = []
-    for index, (_execution_count, cell) in enumerate(successful):
-        if index < cutoff:
-            blocks.append(
-                f"Earlier cell {cell['id']} (revision {cell['revision']}) defined: "
-                f"{_cell_signature(cell['source'])}"
-            )
-        else:
-            blocks.append(f"Successful cell {cell['id']} (revision {cell['revision']}):\n{cell['source']}")
-    return "\n\n".join(blocks)
+    return "\n\n".join(
+        f"Successful cell {cell['id']} (revision {cell['revision']}):\n{cell['source']}"
+        for _execution_count, cell in successful
+    )
 
 
 def _markdown_instruction(instruction: str) -> str | None:
