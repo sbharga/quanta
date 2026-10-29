@@ -3,6 +3,8 @@ name = "quanta"
 version = "0.1.0"
 description = "A live AI-powered data analysis notebook built with Flask and LangGraph"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
     "flask>=3.1.2",

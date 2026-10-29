@@ -2,6 +2,8 @@
 
 Quanta is a local Flask and LangGraph application that turns a Kaggle dataset into a live, AI-authored analysis notebook. It downloads and inventories the dataset, proposes analysis questions, and streams code, narrative, tables, plots, progress, and errors while a language model iteratively works through the request.
 
+![A Quanta notebook on a sample cafe-sales dataset: code, a result table, and Matplotlib plots](docs/screenshot.png)
+
 ## Features
 
 - Kaggle dataset URLs and `owner/dataset` slugs
@@ -99,3 +101,7 @@ uv run pytest
 ```
 
 The test suite uses local fixture data and does not require Kaggle or a model API key.
+
+## License
+
+Quanta is released under the [MIT License](LICENSE).
